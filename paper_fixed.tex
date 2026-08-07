@@ -1,0 +1,521 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{cite}
+
+\begin{document}
+
+\title{CAROECT-D: A Scalable Dataset of RGB-Derived Event Streams for Roadside Traffic Monitoring}
+
+\author{
+\IEEEauthorblockN{Author Names Withheld [Citation Needed: author block]}
+\IEEEauthorblockA{Affiliation Withheld [Citation Needed: affiliation block]\\
+Email: withheld@withheld.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Event cameras are attractive for intelligent transportation systems (ITS) because of their microsecond temporal resolution, wide dynamic range, and sparse, motion-triggered output. Static, roadside deployments of event cameras remain comparatively underexplored relative to ego-motion event datasets, and the two existing roadside efforts occupy opposite ends of a cost-fidelity trade-off: eTraM \cite{verma2024etram} preserves sensor fidelity but depends on two million manually drawn bounding boxes, while TUMTraf Event \cite{cress2024tumtraf} automates annotation by projecting RGB detections onto a physically separate event camera, at the cost of a several-pixel targetless-calibration error and day-only pseudo-label supervision. This paper presents the methodology of CAROECT-D, a pipeline that synthesizes event streams directly from RGB video rather than acquiring them from a second, physically offset sensor, so that annotation and events originate from an identical pixel grid by construction. The pipeline converts N-RAW video into 16-bit scene-linear radiance, applies a single frozen geometric undistortion before the data forks into an sRGB annotation branch and a linear event-generation branch, and generates events with two complementary models: a deterministic lowpass-and-threshold model (v2e \cite{hu2021v2e}) and a stochastic drift-diffusion model (Raw2Event/DVS-Voltmeter \cite{ning2025raw2event,lin2022dvsvoltmeter}), the latter avoiding the temporal-layering artifact induced by frame-locked linear interpolation. Dense, multi-class annotations are produced automatically on the RGB branch with the Segment Anything Model 3 (SAM 3) promptable concept segmentation task \cite{carion2025sam3} and transferred to the synthetic event stream through the shared geometry and a shared frame clock. We detail the mathematical formulation of every stage; quantitative experimental validation is left to a subsequent report, as data collection has not yet been completed.
+\end{abstract}
+
+\begin{IEEEkeywords}
+event camera, dynamic vision sensor, roadside perception, intelligent transportation systems, event simulation, automatic annotation, promptable segmentation
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:intro}
+
+A vehicle traveling at typical urban speed displaces more than 8~m within a single second, and a pedestrian more than 1~m; a conventional camera sampling at 30 or 60 frames per second integrates that displacement into motion blur, and loses contrast entirely once ambient illumination falls below what its fixed exposure window can resolve \cite{verma2024etram}. Dynamic Vision Sensors (DVS), commonly called event cameras, sidestep both failure modes by abandoning the fixed-frame acquisition model altogether. Each pixel operates as an independent, asynchronous comparator: it reports a tuple $(x,y,t,p)$, with microsecond timestamp $t$ and polarity $p \in \{0,1\}$, only when the log-intensity at that pixel has changed by more than a fixed contrast threshold since its last report \cite{hu2021v2e}. A static scene produces almost no output; a fast-moving edge produces a dense stream. The resulting sensor exhibits dynamic range in excess of 120~dB and temporal resolution on the order of microseconds, properties that are difficult to obtain from any frame-based sensor at comparable cost \cite{verma2024etram}.
+
+Despite these properties, event cameras remain comparatively unexplored for one specific ITS configuration: a rigidly fixed, elevated, roadside vantage point observing traffic that moves through the scene while the sensor itself does not. The majority of large event-camera benchmarks -- Gen1 \cite{detournemire2020gen1} and the 1~Megapixel Automotive Detection Dataset \cite{perot20201mpx} among them -- are recorded from a moving vehicle, so that every static element of the scene also generates events as the camera's own motion sweeps across it. A camera that does not move generates events only where traffic participants move, which is both the source of the sensor's efficiency advantage for infrastructure deployment and the reason ego-motion-trained models transfer poorly to a stationary vantage point, a domain gap documented quantitatively by both roadside datasets discussed below \cite{verma2024etram,cress2024tumtraf}.
+
+Two efforts have targeted this static, roadside configuration directly, and they resolve the annotation problem in opposite ways. eTraM \cite{verma2024etram} records ten hours of traffic with a Sony IMX636-based Prophesee EVK4~HD sensor mounted at roughly six meters height and a $35^{\circ}$ depression angle, and produces more than two million bounding boxes across eight object classes by manual annotation in CVAT after accumulating events into 30~Hz frames. Manual annotation at this scale is expensive, and the authors report that the resulting label volume is still an order of magnitude below what automatically labeled ego-motion datasets achieve: the 1~Megapixel dataset alone contains 25 million automatically generated boxes from 15 hours of recording \cite{perot20201mpx}, precisely because ego-motion RGB footage can be auto-labeled with an ordinary frame-based detector, while roadside RGB footage of a static scene at night defeats that detector just as it would defeat a human annotator working from the RGB feed alone.
+
+TUMTraf Event \cite{cress2024tumtraf} takes the opposite route: rather than annotate the event stream by hand, it annotates a co-located RGB camera with an ordinary object detector and projects the resulting boxes onto a genuine, physically separate event camera. Because the two sensors do not share an optical path, this requires solving an extrinsic calibration problem without a physical checkerboard target -- infeasible for a camera pair permanently mounted on a roadside gantry -- which the authors solve by treating the motion content of traffic itself as an implicit calibration pattern. The method is effective, but not free: reported reprojection error reaches 3.37~px for a single moving vehicle and 6.72~px in scenes with several independently moving objects \cite{cress2024tumtraf}, and because the day-only RGB detector cannot label its own night-time footage reliably, the resulting training labels are drawn exclusively from daytime sequences under the explicit policy of ``train during the day, detect at night'' \cite{cress2024tumtraf}. The authors state directly that they consider substituting a synthetic event stream for the real one, and reject it because of the sim-to-real gap between simulated and physical DVS output \cite{cress2024tumtraf}; TUMTraf Event and the pipeline presented here can be read as two answers to the same question -- how to obtain event-domain labels for a roadside scene without manual annotation -- that make opposite choices about which source of error to accept.
+
+CAROECT-D accepts the sim-to-real gap as the central problem to be reduced rather than a reason to avoid simulation, and in exchange removes the physical-baseline calibration error entirely. A single, rigidly co-located rig captures both a high-resolution RGB video stream and a genuine event stream from a Sony IMX636 sensor; the RGB stream is processed into a 16-bit scene-linear representation and geometrically undistorted exactly once, after which the pipeline forks into an sRGB branch used only for annotation and a linear-luminance branch used only for event synthesis. Because both branches inherit an identical pixel grid from that single undistortion step, a label produced on the RGB branch corresponds to the physical origin of a synthetic event at the same coordinates without any further spatial transformation. Synthetic events are generated by two complementary physically motivated models rather than one, so that the deterministic temporal-layering artifact of frame-locked simulation and the six-parameter calibration burden of a purely stochastic model can be evaluated against each other rather than assumed away. Dense annotation is produced with SAM~3's promptable concept segmentation task \cite{carion2025sam3}, which requires only a short text prompt per class and propagates instance identity across frames automatically, removing the two-million-box manual annotation bottleneck without inheriting the physical-calibration error of a projected-label approach.
+
+The remainder of this paper is organized as follows. Section~\ref{sec:relwork} reviews event simulation from conventional and raw sensor data, existing roadside event datasets, and promptable segmentation methods used for automatic annotation, and positions CAROECT-D relative to each. Section~\ref{sec:method} presents the full methodology: radiometric linearization (Section~\ref{sec:radiometric}), geometric calibration and shared undistortion (Section~\ref{sec:geometric}), the two event-generation models and their calibration against the physical sensor (Sections~\ref{sec:eventgen}--\ref{sec:calib}), and cross-modal spatiotemporal label transfer (Section~\ref{sec:labeltransfer}). Data collection, training, and quantitative evaluation are left to a subsequent report, since acquisition of the full CAROECT-D corpus has not yet been completed at the time of writing.
+
+\section{Related Work}
+\label{sec:relwork}
+
+\subsection{Event Simulation from Conventional Video}
+
+Synthesizing event streams from ordinary video is attractive because event-camera data acquisition is expensive and event-camera hardware is scarce relative to conventional imaging hardware. ESIM \cite{rebecq2018esim} was among the first simulators to gain wide adoption; it renders a scene procedurally and adaptively samples frames so that the true continuous log-intensity derivative can be approximated closely, but this requires a synthetic 3D environment rather than real footage. vid2e \cite{gehrig2020vid2e} relaxed this requirement by applying learned frame interpolation to existing conventional video datasets before differencing, converting large frame-based corpora into event data without a rendering engine.
+
+v2e \cite{hu2021v2e} argues that both approaches model an idealized DVS pixel -- a sharp, noise-free threshold with no temporal lag -- and that a detector trained on such idealized synthetic events transfers poorly to physical sensor output, which never resembles that ideal. Concretely, v2e explicitly dispels the assumption that DVS output is immune to motion blur or bounded to microsecond latency at all illumination levels: both properties depend on the finite bandwidth of the pixel's photoreceptor, and are correspondingly degraded in low light. Building on this observation, v2e simulates an intensity-dependent lowpass filter that makes dark-region pixels sluggish, a per-pixel Gaussian mismatch in the contrast threshold to mimic fabrication variance, and both leak and photon shot noise, in addition to the core log-intensity thresholding logic. Optionally, v2e first interpolates the input video to a much higher frame rate with a learned frame-interpolation network so that timestamps can be assigned between real frames without excessive temporal aliasing. Because event timestamps are still ultimately assigned by evenly subdividing the interval between two -- possibly interpolated -- input frames, the resulting event stream exhibits \emph{temporal layering}: timestamps cluster at positions that are multiples of a fixed synthetic frame interval, a regularity that does not exist in physical sensor output and that a downstream network can learn to exploit spuriously.
+
+DVS-Voltmeter \cite{lin2022dvsvoltmeter} targets exactly this artifact. Rather than modeling the DVS pixel as a sequence of independently engineered behavioral corrections -- lowpass filter, threshold noise, leak noise, shot noise -- it models the single physical quantity those corrections are all approximating: the internal pixel voltage accumulated since the last event, treated as a stochastic process with drift and diffusion terms derived from the same subthreshold-transistor circuit that produces the pixel's native logarithmic response. Because voltage accumulation is modeled as continuous-time Brownian motion with drift, the waiting time until the next threshold crossing follows a closed-form Inverse Gaussian distribution rather than being assigned by interpolation, which removes the temporal-layering artifact by construction. The authors report a fourfold-to-fivefold improvement in the Wasserstein distance between simulated and real inter-event-time distributions relative to v2e and vid2e, and superior downstream semantic-segmentation accuracy when a network is trained on the resulting synthetic data and evaluated on real DVS recordings \cite{lin2022dvsvoltmeter}. The two simulators are not strict substitutes for one another: DVS-Voltmeter's original formulation omits both the intensity-dependent lowpass filter and the refractory period that v2e includes, so that fast motion under low illumination -- a regime directly relevant to night-time roadside monitoring -- may still be represented more faithfully by v2e's explicit bandwidth model.
+
+\subsection{Event Simulation from Raw Sensor Data}
+
+A separate line of criticism concerns the radiometric domain in which simulation is performed rather than the temporal-sampling strategy. Raw2Event \cite{ning2025raw2event} observes that every simulator discussed above, including DVS-Voltmeter as originally published, is typically applied to video that has already passed through a conventional Image Signal Processor (ISP): automatic exposure control, denoising, and gamma encoding. Each of these operations is designed to produce a visually pleasing image for a human observer, and each actively corrupts the signal a DVS-oriented simulator depends on, since automatic exposure adjustment alone can make static-scene pixel values drift enough to generate spurious events. Raw2Event instead reads raw Bayer sensor data directly from a low-cost camera module before the ISP acts on it, re-implements the DVS-Voltmeter drift-diffusion model in a vectorized form suitable for embedded, real-time execution, and reports a refined three-stage calibration procedure -- histogram binning by local brightness and brightness-rate, a closed-form linearizing regression for the drift parameters, and a final black-box optimization of the diffusion parameters against the Earth Mover's Distance between simulated and real inter-event-time distributions -- that improves on the manual tuning the original DVS-Voltmeter calibration required for its diffusion-related parameters. Raw2Event's own experiments compare their raw-domain simulation against an ISP-processed baseline generated from the same sensor and find that raw-domain simulation preserves high-frequency temporal structure that the ISP-processed baseline loses, which is consistent with -- though obtained independently of -- the design rationale for operating in a 16-bit linear radiometric domain adopted in Section~\ref{sec:radiometric}. Raw2Event's own validation, however, is confined to controlled indoor and tabletop sequences against a DAVIS346 reference camera, and does not include an outdoor traffic scene, a downstream detection task, or a target sensor matching the Sony IMX636 family used in both eTraM and the present work.
+
+\subsection{Roadside and Traffic-Monitoring Event Datasets}
+
+eTraM \cite{verma2024etram} and TUMTraf Event \cite{cress2024tumtraf} are discussed in detail in Section~\ref{sec:intro}; here we summarize the comparison relevant to dataset design. Table~\ref{tab:comparison} contrasts the two along the axes most relevant to CAROECT-D's design choices. Both datasets use SORT-family or IoU-based tracking and multiple detector baselines (RVT, RED, YOLO-family, and fusion variants), and both report that recurrent, temporally aware architectures outperform purely frame-based detectors on event data, a finding that motivates including temporally structured event representations rather than single-frame histograms alone in any downstream detector trained on CAROECT-D.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of roadside static-camera event datasets. Values for CAROECT-D denote design targets, not measured results, since data collection is ongoing.}
+\label{tab:comparison}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+ & eTraM \cite{verma2024etram} & TUMTraf Event \cite{cress2024tumtraf} & CAROECT-D (planned) \\
+\midrule
+Event sensor & Sony IMX636 & Imago EB (640$\times$480) & Sony IMX636 \\
+Event source & Physical & Physical & Synthetic (v2e / \\
+& & & DVS-Voltmeter) \\
+Label source & Manual (CVAT) & RGB pseudo-label & SAM~3 auto-label \\
+Label volume & 2M boxes & 50{,}496 boxes & Not yet measured \\
+Cross-modal error & N/A (event-only) & 3.37--6.72~px & 0~px (shared grid) \\
+Night labels & Manual, present & Day-only source & Design goal \\
+Track IDs & Yes & No & Yes (SAM~3) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Promptable Segmentation for Automatic Annotation}
+
+Automatic annotation of the RGB branch requires a detector that can localize an open, user-specified set of object categories without per-category retraining, since the traffic-participant taxonomy CAROECT-D targets (vehicles of several classes, pedestrians, and micro-mobility) is defined at prompt time rather than fixed at training time. The Segment Anything Model (SAM) \cite{kirillov2023sam} introduced promptable segmentation for single images given a point, box, or mask prompt, without a notion of open-vocabulary text categories or of finding every instance of a concept. SAM~2 \cite{ravi2024sam2} extended the same promptable-segmentation task to video, adding a memory-based tracker that propagates a prompted object's mask across frames, but retained the single-object-per-prompt formulation of the original.
+
+SAM~3 \cite{carion2025sam3} introduces a distinct task, Promptable Concept Segmentation (PCS): given a short noun phrase or an image exemplar, the model detects, segments, and tracks \emph{every} instance of that concept in an image or video, rather than the single instance a point or box prompt would disambiguate. This is the capability CAROECT-D's annotation pipeline depends on, since a single prompt such as ``car'' must resolve to every vehicle in a roadside scene, each with a distinct tracking identity, without additional per-instance prompting. Architecturally, SAM~3 couples a DETR-style \cite{carion2025sam3} image-level detector with a SAM~2-style memory-based video tracker, both conditioned on a shared Perception Encoder backbone, and reports that its central architectural contribution -- a learned global \emph{presence token} that decouples whether a concept is present in a frame from where each candidate instance is located -- yields a measurable gain in image-level classification accuracy over a coupled detector, as detailed in Section~\ref{sec:sam3}. On the SA-Co open-vocabulary benchmark introduced alongside the model, SAM~3 is reported to more than double the concept-segmentation accuracy of the next-best system evaluated \cite{carion2025sam3}. Because SAM~3 was trained on general-domain internet imagery rather than roadside traffic footage specifically, and because it was trained and evaluated on daytime, well-exposed sRGB photography, its behavior on low-light roadside sRGB frames derived from the linearization pipeline in Section~\ref{sec:radiometric} is not established by the original paper and is treated as an open empirical question for the evaluation phase of this project rather than assumed.
+
+Independent of the annotation pipeline, recent work has begun to address the complementary question of how to quantify the realism of a synthetic event stream directly, rather than only through downstream task accuracy; the Event Quality Score (EQS) \cite{eqs2025} proposes a learned latent-space distance between simulated and real event streams for this purpose, and is a candidate metric for the ablation studies described in Section~\ref{sec:method}.
+
+\subsection{Positioning of CAROECT-D}
+
+The three datasets discussed above occupy distinct points in the trade-off between annotation cost, cross-modal spatial accuracy, and dependence on synthetic data. eTraM accepts the highest annotation cost in exchange for a genuine physical event sensor and human-verified labels at every hour of the day. TUMTraf Event reduces annotation cost by projecting automatically generated RGB labels onto a real event sensor, at the cost of a several-pixel calibration error and labels sourced exclusively from daytime footage. CAROECT-D combines the automatic-labeling strategy of TUMTraf Event with a synthetic event stream generated from the same RGB source used for annotation, which removes the physical-baseline calibration error identified in Table~\ref{tab:comparison} by construction rather than by improving calibration accuracy, targets the same sensor family as eTraM so that synthetic and physical event statistics can be compared directly, and inherits the sim-to-real gap that TUMTraf Event's authors explicitly declined to accept. Closing that gap -- rather than avoiding it -- is treated as this project's central empirical question, to be addressed quantitatively once the domain-transfer evaluation described in the forthcoming Experiments section is complete.
+
+\section{Methodology}
+\label{sec:method}
+
+The pipeline is organized around one governing constraint: every downstream step -- event generation, tracking, and automatic annotation -- is meaningful only if it operates on scene-linear, geometrically frozen data. Section~\ref{sec:radiometric} establishes why the radiometric domain must be 16-bit linear rather than 8-bit gamma-encoded. Section~\ref{sec:geometric} establishes a single, shared geometric transform applied once to that linear data, before the pipeline forks into an sRGB annotation branch and a linear event-generation branch. Section~\ref{sec:eventgen} uses the corrected, undistorted linear volume to generate events through two complementary models, whose free parameters are then fit against the physical sensor in Section~\ref{sec:calib}. Section~\ref{sec:labeltransfer} closes the loop: because the two branches share identical geometry and a common frame clock, labels produced by SAM~3 on the sRGB branch transfer to the asynchronous event stream through a simple point-in-mask test, without cross-sensor calibration.
+
+\begin{figure}[t]
+\centering
+% Placeholder: pipeline block diagram.
+\caption{CAROECT-D pipeline overview. Radiometric linearization and geometric undistortion are applied once to a shared 16-bit linear volume before the pipeline forks into an annotation branch (SAM~3) and an event-generation branch (v2e / DVS-Voltmeter), which are re-joined by the spatiotemporal label-assignment operator of Section~\ref{sec:labeltransfer}.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Problem Setting and Notation}
+\label{sec:setting}
+
+Traffic scenes are captured with two rigidly co-located, time-synchronized cameras: a Nikon Z6~III recording 4K N-RAW video with a 20~mm lens, and a LUCID Vision Labs Triton2 event camera (Sony IMX636 sensor, active area $6.2208\times3.4992$~mm) with a 6~mm lens. Both lenses' horizontal fields of view follow the standard pinhole relation
+\begin{equation}
+\text{HFOV} = 2\arctan\!\left(\frac{w}{2f}\right),
+\label{eq:hfov}
+\end{equation}
+which reproduces the two operating points used throughout this design: $84.0^{\circ}$ for the RGB rig ($w=36$~mm, $f=20$~mm) and $54.8^{\circ}$ for the event rig ($w=6.2208$~mm, $f=6$~mm). Because the event sensor's field of view is a strict subset of the RGB sensor's field of view, spatial alignment (Section~\ref{sec:geometric}) is a cropping and registration problem rather than a stereo-baseline problem.
+
+Raw video is processed at the event camera's native frame rate of 119.88~fps. The pipeline branches into (i) an sRGB annotation branch that is tone-mapped for SAM~3, and (ii) a 16-bit linear event-generation branch. The event branch ultimately yields an asynchronous stream of tuples
+\begin{equation}
+e_k = (x_k, y_k, t_k, p_k), \qquad p_k \in \{0,1\},
+\label{eq:eventtuple}
+\end{equation}
+denoting pixel location, microsecond timestamp, and polarity.
+
+\subsection{Radiometric Preprocessing and Photometric Linearization}
+\label{sec:radiometric}
+
+\subsubsection{Weber's Law and the Log-Intensity Trigger}
+
+Physical event sensors respond to the temporal derivative of log-intensity (Weber's Law):
+\begin{equation}
+L(x,y,t) = \ln I(x,y,t).
+\label{eq:logintensity}
+\end{equation}
+An ON event is emitted when the accumulated log-intensity change since the last event exceeds a positive contrast threshold, and an OFF event when it falls below the negative of a positive threshold:
+\begin{equation}
+\Delta L = \ln I_t - \ln I_{t-1}
+\;\Rightarrow\;
+\begin{cases}
+\Delta L \ge \theta_{ON} & \text{(ON event)}\\
+\Delta L \le -\theta_{OFF} & \text{(OFF event)}
+\end{cases}
+\label{eq:trigger}
+\end{equation}
+with $\theta_{ON},\theta_{OFF}>0$.
+
+\subsubsection{Failure Mode of 8-bit Gamma-Encoded Video}
+
+Consumer RGB pipelines output 8-bit frames after a gamma encoding $I_{sRGB}\approx I^{1/\gamma}$, $\gamma\approx 2.2$. Since $\ln(I^{1/\gamma}) = \tfrac{1}{\gamma}\ln I$, feeding this signal directly into an event simulator scales the usable log-intensity range:
+\begin{equation}
+L_{sRGB} = \ln\!\left(I^{1/\gamma}\right) = \frac{1}{\gamma}\ln I
+\;\Rightarrow\;
+\frac{\partial L_{sRGB}}{\partial t} = \frac{1}{\gamma}\,\frac{\partial L}{\partial t}.
+\label{eq:gammascale}
+\end{equation}
+This compresses the true contrast derivative by a constant factor $1/\gamma$, de-calibrating any fixed threshold $\theta$ against the sensor's native response.
+
+A second, independent failure arises from quantization. With $I\in\{0,\dots,255\}$, the smallest representable step near code value $I$ produces a log-intensity jump of approximately
+\begin{equation}
+\Delta L_{step}(I) \;\approx\; \frac{d}{dI}\ln I \;=\; \frac{1}{I},
+\label{eq:quantbound}
+\end{equation}
+a first-order expansion of $\ln(I{+}1)-\ln I$, valid for $I\gg1$. This approximation motivates, rather than quantitatively predicts, both extremes of the 8-bit failure mode -- it is in fact weakest exactly at the dark extreme it is meant to explain, since Eq.~\eqref{eq:quantbound} evaluated at $I=1$ gives $1.0$ against the exact value of $\ln 2\approx0.693$ derived below, a $\sim\!44\%$ discrepancy. The exact values, not the first-order approximation, are what should be read as the quantitative claim. Near $I=1$ (the smallest representable step above black),
+\begin{equation}
+\Delta L_{dark} = \ln 2 - \ln 1 = \ln 2 \approx 0.693,
+\label{eq:darkextreme}
+\end{equation}
+a 100\% relative jump that exceeds any realistic contrast threshold (typically $0.1$--$0.3$), forcing a simulator operating on 8-bit data to register a flood of spurious ON events from imperceptible sensor noise in shadow regions. Near saturation, e.g.\ $I:254\to255$,
+\begin{equation}
+\Delta L_{bright} = \ln 255 - \ln 254 = \ln\!\frac{255}{254} \approx 0.0039,
+\label{eq:brightextreme}
+\end{equation}
+too small to ever cross $\theta$, so the same 8-bit simulator is effectively blind to real motion in bright regions.
+
+\subsubsection{16-bit Linear Radiometry}
+
+CAROECT-D bypasses the camera's Image Signal Processor (ISP) entirely and exports 16-bit linear TIFFs directly from N-RAW, so $I\in\{0,\dots,65535\}$, a 256-fold larger quantization space than 8-bit. Equation~\eqref{eq:quantbound} shows why this matters directly: for the same absolute scene darkness that produced $I=1$ at 8-bit, the equivalent 16-bit code value is on the order of $I\approx256$ (the exact 8-to-16-bit scale factor is $65536/256=256$), giving
+\begin{equation}
+\Delta L_{step}(256) = \ln 257 - \ln 256 \approx 0.0039,
+\label{eq:sixteenbitshadow}
+\end{equation}
+i.e.\ the shadow regime at 16-bit inherits the same fine log-intensity resolution that only the brightest regime enjoyed at 8-bit (compare Eq.~\eqref{eq:brightextreme}). Because the data also bypasses the non-linear gamma curve, pixel values remain proportional to photon count, so Eq.~\eqref{eq:gammascale} reduces to the identity $L_{sRGB}=L$ ($\gamma=1$). Equations~\eqref{eq:quantbound}--\eqref{eq:sixteenbitshadow} together justify targeting the $>120$~dB dynamic range of the physical Sony IMX636 sensor from a 16-bit linear source rather than an 8-bit tone-mapped one, and are consistent with the independent raw-versus-ISP comparison reported for Raw2Event \cite{ning2025raw2event}, obtained on different hardware.
+
+\subsubsection{Physical Corrections on Linear Data}
+
+Because the exported data remains scene-linear, standard radiometric calibration is valid prior to any tone mapping:
+\begin{equation}
+I_{corr} = (I_{raw} - I_{dark}) \cdot M_{gain} \cdot W_{gain} \cdot S_{exp},
+\label{eq:radcorr}
+\end{equation}
+where $I_{dark}$ is the dark-frame bias (mean of lens-cap exposures), removing sensor black level; $M_{gain}(x,y) = \overline{I_{flat}-I_{dark}} \,/\, \left(I_{flat}(x,y)-I_{dark}(x,y)\right)$ is the flat-field gain map -- the mean corrected flat-frame level divided by its per-pixel value -- normalizing vignetting and fixed-pattern sensitivity so a uniformly lit scene yields a uniform image; $W_{gain}$ is a per-channel gray-card white-balance gain, $W_{gain,c} = \bar{g}_{gray}/\bar{c}_{gray}$ for $c\in\{R,G,B\}$, normalizing a neutral patch to equal channel response; and $S_{exp}$ is a scalar (or per-channel gain) normalizing residual exposure and ISO differences across capture sessions to a common reference. Executing Eq.~\eqref{eq:radcorr} before the pipeline forks guarantees that static spatial gradients, such as a vignette corner, do not masquerade as temporal log-intensity change and falsely trigger events under minor camera vibration.
+
+\subsection{Geometric Lens Calibration and Shared Undistortion}
+\label{sec:geometric}
+
+\subsubsection{Ideal Pinhole Projection}
+
+\begin{equation}
+\begin{bmatrix} u\\ v\\ 1 \end{bmatrix}
+=
+\begin{bmatrix} f_x & 0 & c_x\\ 0 & f_y & c_y\\ 0 & 0 & 1 \end{bmatrix}
+\begin{bmatrix} X_c\\ Y_c\\ Z_c \end{bmatrix}
+= K \begin{bmatrix} X_c\\ Y_c\\ Z_c \end{bmatrix},
+\label{eq:pinhole}
+\end{equation}
+where $f_x,f_y$ are the focal lengths in pixels and $(c_x,c_y)$ is the principal point.
+
+\subsubsection{Brown-Conrady Distortion Model}
+
+Real lenses violate Eq.~\eqref{eq:pinhole} through radial and tangential distortion, warping ideal coordinates $(x,y)$ into observed coordinates $(x_{dist},y_{dist})$ \cite{zhang2000calibration}:
+\begin{align}
+x_{dist} &= x\left(1+k_1 r^2+k_2 r^4+k_3 r^6\right) + \left[2p_1 xy + p_2\left(r^2+2x^2\right)\right] \label{eq:distx}\\
+y_{dist} &= y\left(1+k_1 r^2+k_2 r^4+k_3 r^6\right) + \left[p_1\left(r^2+2y^2\right) + 2p_2 xy\right] \label{eq:disty}
+\end{align}
+with $r=\sqrt{x^2+y^2}$, $k_{1,2,3}$ the radial coefficients and $p_{1,2}$ the tangential coefficients, calibrated via a checkerboard target against the intrinsic matrix $K$ of Eq.~\eqref{eq:pinhole} using a standard planar calibration procedure \cite{zhang2000calibration}.
+
+\subsubsection{Shared-by-Construction Geometry}
+
+The undistortion of Eqs.~\eqref{eq:distx}--\eqref{eq:disty}, followed by an affine resize to the event sensor's native array size,
+\begin{equation}
+\begin{bmatrix} x'\\ y' \end{bmatrix}
+=
+\begin{bmatrix} 1280/W_0 & 0\\ 0 & 720/H_0 \end{bmatrix}
+\begin{bmatrix} x\\ y \end{bmatrix},
+\label{eq:resize}
+\end{equation}
+is computed exactly once on the shared 16-bit linear array $I_{corr}$, before the pipeline forks into (i) an sRGB-encoded branch for SAM~3 and (ii) a linear-luminance branch for event simulation. Because both branches are derived from the identical pixel grid produced by Eqs.~\eqref{eq:distx}--\eqref{eq:resize} at the same $1280\times720$ resolution, the spatial mapping between the two domains is, by construction, the identity:
+\begin{equation}
+\begin{bmatrix} x_{event}\\ y_{event} \end{bmatrix}
+=
+\begin{bmatrix} 1 & 0\\ 0 & 1 \end{bmatrix}
+\begin{bmatrix} u_{SAM}\\ v_{SAM} \end{bmatrix}.
+\label{eq:identitymap}
+\end{equation}
+This is the geometric precondition Section~\ref{sec:labeltransfer} relies on to avoid a targetless, cross-sensor calibration of the kind required in \cite{cress2024tumtraf}. Equation~\eqref{eq:identitymap} holds only if no further per-pixel-moving operation is applied independently to either branch after the fork; the pipeline therefore applies optional digital stabilization, when enabled, once on the shared array prior to the fork as well, alongside Eqs.~\eqref{eq:distx}--\eqref{eq:resize}, and disables it entirely for sequences intended for evaluation against the physical Triton2 sensor, since a real event camera cannot itself be digitally stabilized and evaluation should not compare a stabilized synthetic stream against an unstabilized physical one.
+
+\subsection{High-Fidelity Event Generation from Linear Radiance}
+\label{sec:eventgen}
+
+Both event-generation models below consume the same upstream artifact: the corrected, undistorted, resized linear volume $I_{corr}$ from Sections~\ref{sec:radiometric}--\ref{sec:geometric}. Only the temporal event-generation logic differs between Sections~\ref{sec:v2emodel} and~\ref{sec:rawmodel}.
+
+\subsubsection{Temporal Sampling Rate and Finite-Difference Fidelity}
+
+Both models approximate the continuous derivative $\partial L/\partial t$ from discrete frames via a forward difference,
+\begin{equation}
+\left.\frac{\partial L}{\partial t}\right|_{t=t_i} \approx
+\frac{L(x,y,t_{i+1}) - L(x,y,t_i)}{\Delta t_{frame}},
+\label{eq:finitediff}
+\end{equation}
+whose truncation error is $O(\Delta t_{frame})$. Standard video datasets operate at 30~fps ($\Delta t_{frame}\approx33.3$~ms); this pipeline instead records at the event camera's native 119.88~fps ($\Delta t_{frame}\approx8.34$~ms), a roughly fourfold reduction in the sampling interval, which both tightens the approximation error in Eq.~\eqref{eq:finitediff} and reduces the inter-frame spatial displacement of moving objects, mitigating the smeared, frame-locked event clusters that coarse frame rates produce.
+
+\subsubsection{The v2e Deterministic Pipeline}
+\label{sec:v2emodel}
+
+\textbf{Luma conversion.} The linear RGB volume is reduced to a single-channel luma signal,
+\begin{equation}
+Y = c_R R + c_G G + c_B B.
+\label{eq:luma}
+\end{equation}
+The reference v2e implementation \cite{hu2021v2e} defaults to BT.601/BT.709 weights; because this pipeline operates on wide-gamut, 16-bit linear N-RAW data rather than tone-mapped video, it instead adopts ITU-R BT.2020 weights $(c_R,c_G,c_B)=(0.2627, 0.6780, 0.0593)$, which sum to unity and match the sensor's native color primaries more closely. Frame upsampling via the learned interpolation network v2e optionally applies is disabled, since native capture already occurs at 119.88~fps; enabling it would risk hallucinated motion detail between real frames that are already closely spaced.
+
+\textbf{Hybrid lin-log mapping.} A pure logarithm diverges as $Y\to0$, so v2e uses a piecewise mapping with transition point $I_{lin}$ (typically 20~DN):
+\begin{equation}
+L_{in} =
+\begin{cases}
+\ln Y, & Y \ge I_{lin}\\[4pt]
+\dfrac{Y}{I_{lin}}\ln I_{lin}, & Y < I_{lin}
+\end{cases}
+\label{eq:linlog}
+\end{equation}
+Both branches of Eq.~\eqref{eq:linlog} agree at $Y=I_{lin}$, since $\ln I_{lin}=\tfrac{I_{lin}}{I_{lin}}\ln I_{lin}$, so the mapping is continuous, and the linear branch avoids the numerical divergence and quantization noise of $\ln(0^{+})$.
+
+\textbf{Intensity-dependent lowpass filter.} Physical DVS pixels have finite analog bandwidth that grows with incident light, producing motion blur in low light \cite{hu2021v2e}. This is modeled as a discretized first-order RC lowpass:
+\begin{equation}
+\begin{aligned}
+L_{lp}[k] &= L_{lp}[k-1] + \alpha\left(L_{in}[k]-L_{lp}[k-1]\right), \\
+\alpha &= \frac{\Delta t}{\tau}, \quad \tau = \frac{1}{2\pi f_c(Y)}
+\end{aligned}
+\label{eq:lowpass}
+\end{equation}
+
+with cutoff frequency $f_c(Y)$ monotonically increasing in $Y$: bright pixels track $L_{in}$ almost instantly ($\alpha\approx1$), while dark pixels lag ($\alpha\to0$).
+
+\textbf{Event generation and memory update.}
+\begin{align}
+\Delta L &= L_{lp}-L_{mem}, \qquad
+N_e = \left\lfloor \frac{|\Delta L|}{\theta} \right\rfloor, \label{eq:eventcount}\\
+L_{mem} &\leftarrow L_{mem} + N_e\,\theta\,\mathrm{sign}(\Delta L), \label{eq:memupdate}
+\end{align}
+fired whenever $\Delta L\ge\theta_{ON}$ or $\Delta L\le-\theta_{OFF}$ per Eq.~\eqref{eq:trigger}, with a frozen, per-pixel Gaussian threshold mismatch $\theta_{pixel}\sim\mathcal{N}(\theta_{nominal},\sigma_\theta^2)$ modeling fabrication variance across the sensor array.
+
+\textbf{Refractory period.} After firing, a pixel is held silent for a fixed dead time $\tau_{ref}$ regardless of further intensity change,
+\begin{equation}
+t_{k+1} - t_k \ge \tau_{ref},
+\label{eq:refractory}
+\end{equation}
+bounding the maximum per-pixel event rate to $f_{max}=1/\tau_{ref}$ and truncating the long, smeared event trails a fast-moving high-contrast edge would otherwise produce.
+
+\textbf{Non-idealities.} Leak events model charge leakage as a continuous drift of the memorized state,
+\begin{equation}
+L_{mem}(t) = L_{mem}(t_0) - R_{leak}\cdot(t-t_0),
+\label{eq:leak}
+\end{equation}
+and shot noise is modeled as a Bernoulli draw per time step with a rate that increases as $Y$ decreases,
+\begin{equation}
+p = R_n(Y)\cdot\Delta t,\qquad u\sim\mathcal{U}(0,1),\ \text{fire if } u<p \text{ or } u>1-p.
+\label{eq:shotnoise}
+\end{equation}
+
+\textbf{Deterministic timestamping.} Given $N_e$ events between frames at $t_j$ and $t_{j+1}$, v2e distributes them evenly:
+\begin{equation}
+t_k = t_j + k\cdot\frac{t_{j+1}-t_j}{N_e},\qquad k\in\{1,\dots,N_e\}.
+\label{eq:v2etimestamp}
+\end{equation}
+Because Eq.~\eqref{eq:v2etimestamp} locks every timestamp to a rigid, frame-rate-derived grid, the resulting event stream exhibits temporal layering: timestamps cluster at positions that are evenly spaced multiples of the synthetic frame interval, a regularity that does not exist in physical sensor output. This artifact, and DVS-Voltmeter's original criticism of it \cite{lin2022dvsvoltmeter}, motivates Section~\ref{sec:rawmodel}.
+
+\subsubsection{The Raw2Event / DVS-Voltmeter Stochastic Pipeline}
+\label{sec:rawmodel}
+
+Raw2Event couples the DVS-Voltmeter stochastic voltage model \cite{lin2022dvsvoltmeter} to the raw linear ingestion already established in Section~\ref{sec:radiometric} \cite{ning2025raw2event}: it operates directly on $I_{corr}$, bypassing the ISP, rather than on tone-mapped video frames as in the generic DVS-Voltmeter formulation.
+
+\textbf{Voltage as Brownian motion with drift.} Instead of a deterministic per-frame difference, the internal pixel voltage change over a time step $\Delta t$ is modeled as a Wiener process with drift:
+\begin{equation}
+\Delta V_d = \mu\,\Delta t + \sigma\,W(\Delta t).
+\label{eq:brownian}
+\end{equation}
+Drift and diffusion are parametrized by six calibrated constants \cite{lin2022dvsvoltmeter}:
+\begin{equation}
+\mu = \frac{k_1}{\bar{L} + k_2}\,k_{dL} + k_4 + k_5\bar{L},
+\qquad
+\sigma = \frac{k_3}{\bar{L} + k_2}\sqrt{\bar{L}} + k_6,
+\label{eq:driftdiff}
+\end{equation}
+where $\bar{L}$ is local mean brightness, expressed on the same $0$--$255$ digital-number (DN) scale the constants $k_1,\dots,k_6$ were originally fit on rather than in the pipeline's native 16-bit range; $I_{corr}$ is therefore rescaled by $65536/255\approx257$ before entering Eq.~\eqref{eq:driftdiff}, preserving sub-integer precision rather than requantizing to 8 bits. $k_{dL}=d\bar{L}/dt$ is its rate of change, $k_1$ a signal-gain constant, $k_2$ a darkness-limiting offset, $k_4,k_5$ thermal and parasitic-photocurrent leakage drift, $k_3$ a photon-shot-noise scale, and $k_6$ a baseline electronic noise floor. The constants are initialized from the DVS346 preset reported in \cite{lin2022dvsvoltmeter} as a starting point rather than a sensor-matched value, since no published constants exist for the Sony IMX636; Section~\ref{sec:calib} refits them against the co-located physical Triton2 sensor.
+
+\textbf{Circuit sign convention.} In the source circuit, the log-domain photoreceptor stage inverts sign, so that a \emph{brightening} scene ($\mu>0$) drives the memorized voltage \emph{downward} toward an ON barrier at $-\theta_{ON}$, and a darkening scene drives it upward toward an OFF barrier at $+\theta_{OFF}$ \cite{lin2022dvsvoltmeter}; this is the opposite pairing from the more intuitive convention of an ON barrier at $+\theta_{ON}$, and is followed here without alteration since Eq.~\eqref{eq:brownian}--\eqref{eq:polarity} are consumed by the unmodified reference implementation rather than re-derived.
+
+\textbf{Polarity as a two-barrier absorption problem.} Because $\Delta V_d$ is a single process facing two barriers simultaneously, the sign of $\mu$ biases which barrier is more likely to be hit first but does not determine it deterministically except in the $|\mu|/\sigma\to\infty$ limit. The exact probability that the ON barrier is absorbed first follows the classical gambler's-ruin solution for Brownian motion with drift \cite{lin2022dvsvoltmeter}:
+\begin{equation}
+P(\text{ON}) = \frac{\exp\!\left(-2\mu\theta_{ON}/\sigma^2\right) - 1}{\exp\!\left(-2\mu\theta_{ON}/\sigma^2\right) - \exp\!\left(2\mu\theta_{OFF}/\sigma^2\right)}.
+\label{eq:polarity}
+\end{equation}
+
+\textbf{First-passage-time sampling.} Conditioned on which barrier is hit, the classical first-passage-time result for Brownian motion with drift gives the waiting time as an Inverse Gaussian (Wald) distribution; the single-barrier approximation used in practice,
+\begin{align}
+\tau_{ON} &\sim IG\!\left(\frac{\theta_{ON}}{|\mu|},\ \frac{\theta_{ON}^2}{\sigma^2}\right), \qquad
+\tau_{OFF} \sim IG\!\left(\frac{\theta_{OFF}}{|\mu|},\ \frac{\theta_{OFF}^2}{\sigma^2}\right), \label{eq:igon}
+\end{align}
+reducing to a L\'evy distribution when $\mu=0$ \cite{lin2022dvsvoltmeter}, is exact only in the same $|\mu|/\sigma\to\infty$ limit as Eq.~\eqref{eq:polarity}'s deterministic case and is otherwise a good approximation when one barrier's absorption probability dominates the other's. Because timestamps sampled from Eq.~\eqref{eq:igon} are continuous random variables rather than points on a fixed frame-derived grid, this model produces microsecond jitter consistent with physical DVS circuit behavior and removes the temporal-layering artifact of Eq.~\eqref{eq:v2etimestamp} by construction, at the cost of requiring six calibrated circuit parameters rather than a single contrast threshold, and of omitting v2e's intensity-dependent lowpass filter and refractory period (Eq.~\eqref{eq:refractory}) in the original formulation \cite{lin2022dvsvoltmeter}.
+
+\subsection{Domain-Matched Calibration Against the Physical Sensor}
+\label{sec:calib}
+
+Both event-generation models above expose free parameters -- $\theta_{ON},\theta_{OFF}$ for v2e; $k_1,\dots,k_6$ for DVS-Voltmeter -- that determine the quantitative match between synthetic and physical events, and neither model's published defaults were fit to the Sony IMX636. CAROECT-D calibrates both against the same rigidly co-located Triton2 sensor used to validate the shared-geometry claim of Section~\ref{sec:geometric}, in two stages.
+
+\textbf{Stage 1: direct contrast-threshold estimation.} A physical target with a known log-intensity step $\Delta L_{scene}=\ln(I_2/I_1)$ between two uniform patches is swept across the sensor's field of view. Each pixel crossing the step boundary fires a burst of $N$ same-polarity events before settling; since each event consumes exactly $\theta$ of accumulated log-intensity by construction (Eq.~\eqref{eq:trigger}), the physical threshold is recovered directly from the observed burst size, averaged over many crossings and pixels for robustness:
+\begin{equation}
+C_{real} \;\approx\; \frac{\Delta L_{scene}}{\bar{N}}.
+\label{eq:crealcalib}
+\end{equation}
+$C_{real}$ initializes $\theta_{ON}=\theta_{OFF}$ in Eq.~\eqref{eq:trigger} directly; it does not by itself determine $k_1,\dots,k_6$, since the DVS-Voltmeter parametrization of Eq.~\eqref{eq:driftdiff} does not expose a single threshold in closed form.
+
+\textbf{Stage 2: closed-loop matching to real event statistics.} The remaining parameters -- $\sigma_\theta$, $f_c(\cdot)$, $\tau_{ref}$ for v2e; $k_2,\dots,k_6$ for DVS-Voltmeter -- are fit by minimizing the discrepancy between simulated and physical event streams recorded from the same scene under matched lighting, aggregated over static-scene event rate, motion-triggered event rate, and inter-event latency at a moving edge:
+\begin{equation}
+\theta^{*} = \arg\min_{\theta}\ \left\| \mathbf{m}_{sim}(\theta) - \mathbf{m}_{real} \right\|^2,
+\label{eq:calibloss}
+\end{equation}
+solved by coordinate descent over one parameter at a time or by Bayesian (Tree-structured Parzen Estimator) search over the full parameter vector jointly, and re-run per lighting condition since both $C_{real}$ and the noise-related constants are illumination-dependent. This calibration is not performed post hoc on the final trained detector; it is a preprocessing step that determines the operating point of Sections~\ref{sec:v2emodel}--\ref{sec:rawmodel} before any synthetic event is generated for training.
+
+\subsection{Cross-Modal Spatiotemporal Label Transfer}
+\label{sec:labeltransfer}
+
+\subsubsection{SAM 3 as the Label Source}
+\label{sec:sam3}
+
+SAM~3 \cite{carion2025sam3} performs Promptable Concept Segmentation (PCS): given a short noun phrase such as ``car'' or ``pedestrian,'' it detects, segments, and tracks every instance of that concept across a video. Its central architectural contribution decouples whether a concept is present in a frame from where each candidate instance is located, via a learned global presence token. Rather than predicting $p(\text{query}_i \text{ matches NP})$ directly for each object query, the model factorizes the prediction as
+\begin{equation}
+p(q_i \text{ matches NP}) = p(q_i \text{ matches NP} \mid \text{NP present}) \cdot p(\text{NP present}),
+\label{eq:presence}
+\end{equation}
+where the second factor is predicted once per frame by a dedicated presence token shared across all object queries, trained with a binary cross-entropy loss, and the first factor is predicted independently by each query's own classification head \cite{carion2025sam3}. At inference, the two scores are multiplied to obtain each query's total object score. The authors report that this decomposition measurably improves image-level recognition accuracy relative to a coupled detector, and is particularly effective on adversarial negative prompts \cite{carion2025sam3}.
+
+For video, SAM~3 propagates spatio-temporal masklets $\hat{\mathcal{M}}_{\tau}^{i}$ for object $i$ at frame $\tau$ using a memory-based tracker inherited from SAM~2 \cite{ravi2024sam2,carion2025sam3}, and resolves tracker drift and false positives with a Masklet Detection Score computed from an IoU-based frame-wise matching function against the detector's independent per-frame output $\mathcal{D}_{\tau}$:
+\begin{equation}
+\Delta_i(\tau) =
+\begin{cases}
++1, & \exists\, d\in\mathcal{D}_\tau \text{ s.t. } \mathrm{IoU}(d,\hat{\mathcal{M}}_\tau^i) > \text{iou\_threshold}\\
+-1, & \text{otherwise}
+\end{cases}
+\label{eq:mdsindicator}
+\end{equation}
+\begin{equation}
+S_i(t,t') = \sum_{\tau=t}^{t'} \Delta_i(\tau).
+\label{eq:mds}
+\end{equation}
+A candidate masklet is confirmed only after a short, fixed confirmation delay measured in frames, and is discarded if its running score $S_i$ falls below zero over that window, i.e.\ if it is not matched to a detection for at least half the frames in the confirmation window; a confirmed masklet is subsequently suppressed, though retained in the tracker state, if its lifetime score falls below zero at any later frame \cite{carion2025sam3}. Independently, the detector periodically re-prompts the tracker with high-confidence detections that overlap a tracked masklet, recovering identity after drift, occlusion, or confusion with a visually similar distractor \cite{carion2025sam3}. The exact confirmation-window length, re-prompt interval, and IoU/confidence thresholds are internal hyperparameters of the released SAM~3 implementation and are not restated here as specific numbers, since they were not independently confirmed against the primary source at the time of writing; Eqs.~\eqref{eq:presence}--\eqref{eq:mds} and the qualitative confirmation/re-prompting mechanism they formalize, by contrast, are corroborated by the model's public technical description \cite{carion2025sam3}. Together, this is the mechanism by which a single text prompt such as ``car'' yields a dense set of confirmed, identity-consistent masks $M_{i,n}$ for every vehicle instance $n$ at every frame $i$ of the RGB branch, without per-instance manual prompting.
+
+\subsubsection{Spatial Alignment via the Frozen Shared Geometry}
+
+By Section~\ref{sec:geometric}, a SAM~3 pixel coordinate $(u,v)$ in the sRGB branch and the physical event coordinate $(x,y)$ refer to the same undistorted, resized grid, the identity map of Eq.~\eqref{eq:identitymap}. This differs from TUMTraf Event, where a physical baseline between two separately positioned sensors necessitates a targetless extrinsic calibration procedure -- motion-edge extraction, DBSCAN clustering, Jonker-Volgenant assignment, RANSAC, and ICP refinement -- reported to introduce a reprojection error of 3.37--6.72~px \cite{cress2024tumtraf}. CAROECT-D avoids this class of error by construction rather than by improving calibration accuracy.
+
+\subsubsection{Temporal Synchronization}
+
+SAM~3 produces discrete, per-frame annotations, while both event models of Section~\ref{sec:eventgen} produce continuous timestamps $t_k$. Both, however, are driven from the same underlying 119.88~fps frame clock:
+\begin{equation}
+t_i = i \cdot \Delta t_{frame}, \qquad \Delta t_{frame} \approx 8.34~\text{ms}.
+\label{eq:frameclock}
+\end{equation}
+Because both event models generate events strictly from the log-intensity transition between frame $i$ and frame $i{+}1$, every event resulting from that transition satisfies
+\begin{equation}
+t_k \in [t_i, t_{i+1}).
+\label{eq:temporalwindow}
+\end{equation}
+
+\subsubsection{Sub-Frame Position via Linear Interpolation}
+
+Rather than freezing an object's position for the full $\Delta t_{frame}$ interval, each tracked object's box (and, where available, its mask) is linearly interpolated between the two SAM~3 observations bracketing the event's own timestamp $t_k\in[t_i,t_{i+1})$:
+\begin{equation}
+\alpha = \frac{t_k - t_i}{t_{i+1}-t_i}, \qquad
+B_n(t_k) = (1-\alpha)\,B_{i,n} + \alpha\,B_{i+1,n},
+\label{eq:interp}
+\end{equation}
+evaluated only when both $B_{i,n}$ and $B_{i+1,n}$ exist for the same track identity $n$ within a bounded gap of $G$ frames; a track absent from either endpoint, or separated from its neighboring observation by more than $G$ frames (indicating an occlusion SAM~3 did not bridge), is not interpolated across that gap, and events in that interval are left unassigned to $n$ rather than assigned to a linearly extrapolated position. Equation~\eqref{eq:interp} gives every event microsecond-resolution positional grounding despite the underlying annotation being produced at the discrete frame rate of Eq.~\eqref{eq:frameclock}.
+
+\subsubsection{The Label-Assignment Operator}
+
+Combining the spatial identity of Eq.~\eqref{eq:identitymap} with the interpolated position of Eq.~\eqref{eq:interp} yields a single spatiotemporal inclusion test. An event $e_k=(x_k,y_k,t_k,p_k)$ is assigned object identity $ID_n$ if and only if it falls within object $n$'s interpolated mask (or, in the box-only variant, its interpolated bounding box $B_n(t_k)$) at its own timestamp:
+\begin{equation}
+\mathrm{Assign}(e_k) =
+\begin{cases}
+ID_n, & (x_k, y_k) \in M_n(t_k) \\[4pt]
+\text{Background}, & \text{otherwise}
+\end{cases}
+\label{eq:assign}
+\end{equation}
+where $M_n(t_k)$ denotes the mask (or box) of Eq.~\eqref{eq:interp} evaluated at $t_k$. When $(x_k,y_k)$ falls inside more than one object's interpolated region simultaneously, the assignment is resolved to the object with the smaller interpolated area at $t_k$, under the heuristic that a nearer or foreground object typically occupies a smaller image-plane footprint than the object it occludes in a roadside perspective; this is a heuristic tie-break rather than a depth-ordering guarantee, and its effect on label quality is quantified directly by the fraction of multiply-matched events reported at run time.
+
+Algorithm~\ref{alg:labeltransfer} summarizes this procedure. Because the spatial term reduces to a point-in-mask test at an already-interpolated position and the temporal term is folded into Eq.~\eqref{eq:interp}, Eq.~\eqref{eq:assign} can be evaluated independently for every generated event, which parallelizes trivially across events or across frame intervals, at the cost of one interpolation per candidate track per event rather than a single frame-indexed lookup.
+
+\begin{algorithm}[t]
+\caption{Cross-Modal Spatiotemporal Label Assignment}
+\label{alg:labeltransfer}
+\begin{algorithmic}[1]
+\Require Event stream $\{e_k=(x_k,y_k,t_k,p_k)\}_{k=1}^{K}$; frame index sequence $\{i\}$ with clock $t_i = i \cdot \Delta t_{frame}$; per-frame confirmed SAM~3 masks $\{M_{i,n}\}$ for object identities $n$
+\Ensure Labeled event stream $\{(e_k, \ell_k)\}$, $\ell_k \in \{ID_1,\dots,ID_N,\text{Background}\}$
+\For{each event $e_k$}
+    \State $i \gets \lfloor t_k / \Delta t_{frame} \rfloor$ \Comment{Eq.~\eqref{eq:frameclock}--\eqref{eq:temporalwindow}}
+    \State $\ell_k \gets \text{Background}$
+    \For{each confirmed object $n$ at frame $i$}
+        \If{$(x_k, y_k) \in M_{i,n}$} \Comment{Eq.~\eqref{eq:identitymap}, identity spatial map}
+            \State $\ell_k \gets ID_n$
+            \State \textbf{break}
+        \EndIf
+    \EndFor
+\EndFor
+\State \Return $\{(e_k,\ell_k)\}$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Complexity.} For $K$ events and $N_i$ confirmed objects at frame $i$, the naive point-in-mask test costs $O\!\left(\sum_k N_{i(k)}\right)$ in the worst case; in practice $M_{i,n}$ is stored as a rasterized label map so that membership is an $O(1)$ array lookup per event, giving overall $O(K)$ label assignment independent of $N_i$, at the cost of $O(HW)$ memory per frame for the label map, where $H\times W$ is the shared $1280\times720$ resolution of Eq.~\eqref{eq:resize}.
+
+\textbf{Advantages.} The procedure requires no per-sequence calibration search, degrades gracefully to \emph{Background} for any event outside a confirmed mask rather than producing a spurious assignment, and is agnostic to which of the two event-generation models of Section~\ref{sec:eventgen} produced $e_k$, so v2e-derived and DVS-Voltmeter-derived streams can be labeled with the same code path.
+
+\textbf{Limitations.} The procedure inherits any localization error already present in the SAM~3 masks themselves (Section~\ref{sec:sam3} notes that SAM~3's behavior on low-light, linearized roadside sRGB frames is not established by its original training and evaluation domain); Eq.~\eqref{eq:interp} gives sub-frame positional resolution but not sub-frame \emph{shape} resolution, since the interpolated mask is a linear blend of two discretely-observed masks rather than a re-segmentation at $t_k$, so rapid non-rigid deformation (a turning vehicle, an articulating pedestrian) within one $\Delta t_{frame}\approx8.34$~ms window is smoothed rather than tracked exactly; and the smallest-interpolated-area tie-break for overlapping masks (Section~\ref{sec:labeltransfer}) is a heuristic rather than a depth-ordering guarantee, distinct from the Intersection-over-Minimum ambiguity handling SAM~3 applies internally to its own mask predictions \cite{carion2025sam3}.
+
+\textbf{Summary and connection to Experiments.} Sections~\ref{sec:radiometric}--\ref{sec:labeltransfer} establish, in order, why the pipeline must operate in a 16-bit linear radiometric domain, why geometric undistortion must be computed once and shared rather than recomputed per branch, how two physically distinct event-generation models are derived from that shared linear volume and subsequently fit to the physical Triton2 sensor rather than used at their published defaults, and how the resulting synthetic event stream receives dense automatic labels without manual annotation or physical cross-sensor calibration. This methodology fixes the representation that downstream detector training and domain-transfer evaluation, described in a subsequent report, will operate on; the open questions flagged above -- SAM~3 behavior under linearized low-light conditions, the relative fidelity of the two event-generation models against the physical Triton2 sensor, and quantitative closure of the sim-to-real gap discussed in Section~\ref{sec:relwork} -- are precisely the questions that report is designed to answer empirically.
+
+\section*{Acknowledgment}
+[Citation Needed: funding and acknowledgment text withheld pending author input.]
+
+\begin{thebibliography}{99}
+
+\bibitem{hu2021v2e}
+Y. Hu, S.-C. Liu, and T. Delbruck, ``v2e: From video frames to realistic DVS events,'' in \emph{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. Workshops (CVPRW)}, 2021, pp. 1312--1321.
+
+\bibitem{rebecq2018esim}
+H. Rebecq, D. Gehrig, and D. Scaramuzza, ``ESIM: An open event camera simulator,'' in \emph{Proc. 2nd Conf. Robot Learning (CoRL)}, PMLR, 2018, pp. 969--982.
+
+\bibitem{gehrig2020vid2e}
+D. Gehrig, M. Gehrig, J. Hidalgo-Carri\'o, and D. Scaramuzza, ``Video to events: Recycling video datasets for event cameras,'' in \emph{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2020.
+
+\bibitem{lin2022dvsvoltmeter}
+S. Lin, Y. Ma, Z. Guo, and B. Wen, ``DVS-Voltmeter: Stochastic process-based event simulator for dynamic vision sensors,'' in \emph{Computer Vision -- ECCV 2022}, Lecture Notes in Computer Science, vol. 13667, Springer, 2022, pp. 578--593.
+
+\bibitem{ning2025raw2event}
+Z. Ning, E. Lin, S. R. Iyengar, and P. Vandewalle, ``Raw2Event: Converting raw frame camera into event camera,'' \emph{arXiv preprint arXiv:2509.06767}, 2025.
+
+\bibitem{detournemire2020gen1}
+P. de Tournemire, D. Nitti, E. Perot, D. Migliore, and A. Sironi, ``A large scale event-based detection dataset for automotive,'' \emph{arXiv preprint arXiv:2001.08499}, 2020.
+
+\bibitem{perot20201mpx}
+E. Perot, P. de Tournemire, D. Nitti, J. Masci, and A. Sironi, ``Learning to detect objects with a 1 megapixel event camera,'' in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, vol. 33, 2020, pp. 16639--16652.
+
+\bibitem{verma2024etram}
+A. A. Verma, B. Chakravarthi, A. Vaghela, H. Wei, and Y. Yang, ``eTraM: Event-based traffic monitoring dataset,'' in \emph{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2024, pp. 22637--22646.
+
+\bibitem{cress2024tumtraf}
+C. Cre\ss, W. Zimmer, N. Purschke, B. N. Doan, S. Kirchner, V. Lakshminarasimhan, L. Strand, and A. C. Knoll, ``TUMTraf Event: Calibration and fusion resulting in a dataset for roadside event-based and RGB cameras,'' \emph{IEEE Trans. Intell. Veh.}, vol. 9, no. 7, pp. 5186--5203, 2024.
+
+\bibitem{kirillov2023sam}
+A. Kirillov, E. Mintun, N. Ravi, H. Mao, C. Rolland, L. Gustafson, T. Xiao, S. Whitehead, A. C. Berg, W.-Y. Lo, P. Doll\'ar, and R. Girshick, ``Segment anything,'' in \emph{Proc. IEEE/CVF Int. Conf. Comput. Vis. (ICCV)}, 2023.
+
+\bibitem{ravi2024sam2}
+N. Ravi, V. Gabeur, Y.-T. Hu, R. Hu, C. Ryali, T. Ma, H. Khedr, R. R\"adle, C. Rolland, L. Gustafson, E. Mintun, J. Pan, K. V. Alwala, N. Carion, C.-Y. Wu, R. Girshick, P. Doll\'ar, and C. Feichtenhofer, ``SAM 2: Segment anything in images and videos,'' \emph{arXiv preprint arXiv:2408.00714}, 2024.
+
+\bibitem{carion2025sam3}
+N. Carion, L. Gustafson, Y.-T. Hu, S. Debnath, R. Hu, D. Suris, C. Ryali, K. V. Alwala, H. Khedr, \emph{et al.}, ``SAM 3: Segment anything with concepts,'' \emph{arXiv preprint arXiv:2511.16719}, Meta Superintelligence Labs, 2025.
+
+\bibitem{zhang2000calibration}
+Z. Zhang, ``A flexible new technique for camera calibration,'' \emph{IEEE Trans. Pattern Anal. Mach. Intell.}, vol. 22, no. 11, pp. 1330--1334, 2000.
+
+\bibitem{eqs2025}
+``Event Quality Score (EQS): Assessing the realism of simulated event camera streams via distances in latent space,'' \emph{arXiv preprint arXiv:2504.12515}, 2025. [Author list not independently confirmed -- verify before citing.]
+
+\end{thebibliography}
+
+\end{document}

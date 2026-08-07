@@ -29,13 +29,21 @@ WHAT THIS SCRIPT DOES
 1. Parses the container losslessly (100% our own known format — safe).
 2. Prints a hex dump of the first payload so you can SEE the raw bytes.
 3. Attempts to decode the first payload as standard Prophesee EVT3.0
-   (the well-known public 16-bit-word vectorized format). This is a
-   HYPOTHESIS, not a certainty — the camera's only EventFormat entry is
-   literally named "EVT3_0", which is a strong hint but not direct proof
-   that Arena hands you the bit-exact standard wire format. The script
-   reports x/y/t ranges from the decode attempt; if x stays < 1280 and
-   y stays < 720 and timestamps trend upward, the hypothesis is likely
-   correct. If not, we'll know to look elsewhere instead of guessing.
+   (the well-known public 16-bit-word vectorized format). This is the
+   camera's ONE confirmed real decode path (EventFormat=EVT3_0,
+   EventFormatSize=Bpe16/Bpe64 — XYPT was tried and confirmed NOT to exist
+   on this camera/firmware; see evs_recorder.cpp's top-of-file comment).
+   The script reports x/y/t ranges from the decode attempt; if x stays
+   < 1280 and y stays < 720 and timestamps trend upward, the hypothesis is
+   likely correct for this record. Some records (typically the very first)
+   may instead be a DENSE accumulated frame (baseline=128) rather than
+   sparse EVT3.0 words — analyze_as_dense_frame() checks that separately.
+
+   NOTE: this script decodes ONE record in isolation, so it resets
+   time_low/time_high to 0 at the start of every call — it cannot tell you
+   whether TIME_LOW/TIME_HIGH is continuous across records. For that
+   diagnostic (needed before trusting t for calibration), use:
+     python cevt_to_events.py <file>.cevt --debug-time-continuity
 
 Usage:
     python inspect_cevt.py test.cevt

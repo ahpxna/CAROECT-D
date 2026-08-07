@@ -80,6 +80,16 @@ calibration:
   square_size_m:  0.025
 
 # ═════════════════════════════════════════════════════
+#  GHI EVENT THẬT (evs_recorder.cpp -> xypt_to_h5.py)
+# ═════════════════════════════════════════════════════
+recording:
+  # Dùng cho: (1) calibrate_simulator.py — fit θ simulator khớp vật lý thật,
+  #           (2) eval_event_yolo.py --data <real_test> — domain-transfer test.
+  strict_xypt:   true
+  flat_xypt:     true
+  t_unit: "us"
+
+# ═════════════════════════════════════════════════════
 #  SIMULATORS
 # ═════════════════════════════════════════════════════
 simulator:
@@ -112,3 +122,44 @@ dvs_voltmeter:
   camera_type: DVS346
   k: [5.3, 20, 0.0001, 1.0e-7, 5.0e-9, 1.0e-5]     # preset DVS346 (paper ECCV2022)
   # k: [4.4, 23, 0.0002, 1.0e-7, 5.0e-8, 1.0e-5]   # preset DVS240 (để so sánh)
+
+# ═════════════════════════════════════════════════════
+#  LABEL TRANSFER  (sam3_export_tracks.py -> label_transfer.py)
+# ═════════════════════════════════════════════════════
+label_transfer:
+  score_threshold:   0.3
+  cross_class_iou:   0.85
+  max_gap_frames:    5
+  window_us:         null
+  dense_event_labels: true
+  class_names:
+    - car
+    - truck
+    - bus
+    - motorcycle
+    - person
+    - bicycle
+    - micromobility
+    - other
+
+# ═════════════════════════════════════════════════════
+#  DATASET  (build_event_dataset.py)
+# ═════════════════════════════════════════════════════
+dataset:
+  img_size: [640, 640]
+  export_coco: true
+  # 3 split policy CAROECT-D — điền sau khi có danh sách site thật:
+  # splits:
+  #   by_scene:    {train: [site01..site15], test: [site16..site20]}
+  #   by_view:     {train: [site01_view1..4], test: [site01_view5]}
+  #   by_lighting: {train: [site01_day, site01_dusk], test: [site01_night]}
+
+# ═════════════════════════════════════════════════════
+#  TRAIN / EVAL  (train_event_yolo.py / eval_event_yolo.py)
+# ═════════════════════════════════════════════════════
+train:
+  model:      yolov8n.pt
+  epochs:     100
+  imgsz:      640
+  batch:      16
+  patience:   30

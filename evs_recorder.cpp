@@ -62,6 +62,11 @@
 
 std::atomic<bool> g_stopRequested{ false };
 
+// Countdown for the Step-0 per-buffer diagnostic (see AcquisitionThreadFunc).
+// Not atomic: only ever touched from the single acquisition thread.
+// Set from --debug-buffers [N] (default N=20 when the flag is passed bare).
+int g_debugBufferCount = 0;
+
 void SignalHandler(int /*signum*/)
 {
 	g_stopRequested.store(true, std::memory_order_relaxed);
@@ -332,8 +337,23 @@ void DumpAllNodes(GenApi::INodeMap* pNodeMap, const std::string& filterSubstring
 }
 
 // Sets an enumeration node by symbolic name if the node exists; if optional
-// and absent, does nothing (silently) rather than throwing - EventFormatSize
-// may not exist on every firmware revision, so it is treated as optional.
+// and absent, does nothing (silently) rather than throwing.
+//
+// IMPORTANT — EventFormatSize is NOT independently writable on this camera:
+// a real run hit "[fatal] GenICam exception: Node is not writable." on the
+// SetIntValue() call for EventFormatSize, immediately after EventFormat was
+// set and confirmed successfully. This matches an earlier observation: after
+// setting ONLY EventFormat=EVT3_0 (EventFormatSize never touched), --get-enum
+// EventFormatSize already reported Bpe16. Put together, the simplest
+// explanation is that EventFormatSize is a READ-ONLY reflection driven by
+// whichever EventFormat entry is selected (EVT3_0 -> Bpe16 on this firmware),
+// not an independently settable node — the earlier "stale leftover value"
+// theory (see Stage 1.1 history below) was the wrong explanation for the
+// same symptom. So: try to WRITE only if the node reports writable right
+// now; if it doesn't, fall back to READ-and-verify — if the camera already
+// reports the requested value we're done (that's the expected, healthy case
+// for EventFormatSize), and only throw if it reports something ELSE (a
+// genuine mismatch we can't fix by writing).
 void ApplyEnumIfPresent(GenApi::INodeMap* pNodeMap, const char* nodeName,
                         const std::string& value, bool required)
 {
@@ -353,8 +373,49 @@ void ApplyEnumIfPresent(GenApi::INodeMap* pNodeMap, const char* nodeName,
 			"first to see the exact symbolic names this camera's firmware exposes.");
 	}
 
+	if (!GenApi::IsWritable(pEnum))
+	{
+		// Not writable right now — could be permanently read-only (driven by
+		// another node, e.g. EventFormatSize following EventFormat), or
+		// temporarily locked by device state. Either way, don't guess:
+		// verify what the camera actually reports and decide from that.
+		int64_t currentVal = pEnum->GetIntValue();
+		if (currentVal == pEntry->GetValue())
+		{
+			std::cout << nodeName << " = " << value << " (already set — node is read-only "
+				<< "on this camera right now, but the current value already matches what "
+				<< "was requested, so this is fine)" << std::endl;
+			return;
+		}
+		throw std::runtime_error(
+			std::string(nodeName) + " is not writable right now, and its current value does "
+			"NOT match the requested '" + value + "' (raw int " +
+			std::to_string(currentVal) + " vs expected " + std::to_string(pEntry->GetValue()) +
+			"). If this is EventFormatSize, it may be entirely driven by the current "
+			"EventFormat selection rather than independently settable on this firmware — "
+			"try a different --event-format-size value that matches what this EventFormat "
+			"actually produces (check via --get-enum " + std::string(nodeName) +
+			" right after setting --event-format alone), or drop --event-format-size "
+			"and rely on the read-back verification instead of a hard requirement.");
+	}
+
 	pEnum->SetIntValue(pEntry->GetValue());
-	std::cout << "Set " << nodeName << " = " << value << std::endl;
+
+	// Confirm the camera actually accepted the value instead of trusting
+	// SetIntValue() blindly — a stale/leftover value from a previous session
+	// (see the Bpe16-leftover incident: EventFormatSize silently kept its
+	// old value from a prior run when this node wasn't touched) can look
+	// identical to a successful set unless we read it back.
+	int64_t confirmVal = pEnum->GetIntValue();
+	if (confirmVal != pEntry->GetValue())
+	{
+		throw std::runtime_error(
+			std::string(nodeName) + ": set to '" + value + "' failed — camera still reports "
+			"raw int value " + std::to_string(confirmVal) + " (expected " +
+			std::to_string(pEntry->GetValue()) + "). Refusing to continue with an ambiguous "
+			"node state.");
+	}
+	std::cout << "Set " << nodeName << " = " << value << " (confirmed)" << std::endl;
 }
 
 // Prints the CURRENT symbolic value of an enum node — deliberately does NOT
@@ -509,65 +570,18 @@ bool TryEnableBoolean(GenApi::INodeMap* pNodeMap, const char* nodeName, bool val
 	}
 }
 
-// --output-format-node/--output-format-value: attempts to switch the camera
-// from its DEFAULT decode (confirmed empirically, via cevt_to_events.py on
-// earlier recordings, to be a DENSE accumulated CD Frame with NO real
-// per-event timestamp - every event in one buffer shares one fabricated
-// timestamp) to XYPT: a SPARSE per-event stream with a REAL microsecond
-// timestamp per event. LUCID's own Arena SDK tech brief states the SDK can
-// "decode XYPT, produce CD Frame, or pass through raw EVT3.0" - so XYPT is
-// a real, documented mode - but the EXACT node/enum-entry name on THIS
-// camera's node map has NOT been confirmed the way EventFormat was (that one
-// was confirmed via --dump-nodes against the real TRT009S-E). Default here
-// is a best-guess name ("EvsOutputFormat" / "XYPT"); if it's wrong, this
-// function does NOT crash and does NOT silently keep recording with a wrong
-// assumption - it prints the exact --dump-nodes commands to find the real
-// name, and the recording proceeds with the camera's untouched default
-// (CD Frame - the same behavior this program always had before this option
-// existed). This is why XYPT can safely be the default here: worst case on
-// an unconfirmed camera, it's a no-op with a clear warning, not a crash and
-// not silent data corruption.
-bool TryApplyOutputFormat(GenApi::INodeMap* pNodeMap, const std::string& nodeName,
-                          const std::string& value)
-{
-	GenApi::CEnumerationPtr pEnum = pNodeMap->GetNode(nodeName.c_str());
-	if (!pEnum.IsValid())
-	{
-		std::cerr << "[output-format] Node '" << nodeName << "' not found on this device - "
-			<< "cannot request '" << value << "' mode. Recording will use whatever the "
-			<< "camera's CURRENT decode setting already is (confirmed CD Frame - dense "
-			<< "accumulated frame, fabricated per-buffer timestamp - on earlier recordings "
-			<< "of this camera). To find the real node name, run:\n"
-			<< "    ./evs_recorder --dump-nodes --filter Frame\n"
-			<< "    ./evs_recorder --dump-nodes --filter Output\n"
-			<< "    ./evs_recorder --dump-nodes --filter Mode\n"
-			<< "then re-run with --output-format-node <RealName> --output-format-value "
-			<< value << "  (or pass --legacy-cdframe to stop requesting XYPT at all)."
-			<< std::endl;
-		return false;
-	}
-
-	GenApi::CEnumEntryPtr pEntry = pEnum->GetEntryByName(value.c_str());
-	if (!pEntry.IsValid())
-	{
-		GenApi::StringList_t symbolics;
-		pEnum->GetSymbolics(symbolics);
-		std::cerr << "[output-format] Node '" << nodeName << "' exists but has no entry '"
-			<< value << "'. Available entries on this camera:\n";
-		for (auto& s : symbolics)
-			std::cerr << "    " << s.c_str() << "\n";
-		std::cerr << "Re-run with --output-format-value <one of the above>. Falling back to "
-			<< "the camera's current decode setting for this recording." << std::endl;
-		return false;
-	}
-
-	pEnum->SetIntValue(pEntry->GetValue());
-	std::cout << "[output-format] " << nodeName << " = " << value
-		<< "  (sparse, per-event, REAL microsecond timestamp expected - verify with "
-		<< "cevt_to_events.py after recording; it now tries this hypothesis FIRST)"
-		<< std::endl;
-	return true;
-}
+// XYPT was chased across two rounds of debugging and is now DEAD for this
+// camera/firmware — confirmed empirically: the node this program tried
+// ("EvsOutputFormat") does not exist on the TRT009S-E's node map (see
+// --dump-nodes --filter Output / Frame / Mode / XY output, all negative),
+// and there is no other candidate node exposing an XYPT-like enum on this
+// firmware. TryApplyOutputFormat(), --output-format-node/value,
+// --legacy-cdframe, --strict-xypt and --flat-xypt have all been removed —
+// this program now ALWAYS uses the camera's one confirmed real decode path
+// (EventFormat=EVT3_0, EventFormatSize=Bpe16/Bpe64), and per-event real
+// microsecond timestamps are recovered entirely offline in
+// cevt_to_events.py by decoding the EVT3.0 TIME_LOW/TIME_HIGH words inside
+// the payload — never from a camera-side XYPT struct that does not exist.
 
 // --erc-rate-limit <Mev/s>: ErcRateLimit is a FLOAT node (interfaceType=5,
 // confirmed via --dump-nodes against the real TRT009S-E on 2026-07-xx) -
@@ -729,6 +743,34 @@ void AcquisitionThreadFunc(Arena::IDevice* pDevice, SpscByteRing& ring, std::ato
 		RecordHeader hdr{};
 		hdr.frameId = pBuffer->GetFrameId();
 		hdr.payloadSize = static_cast<uint64_t>(pBuffer->GetSizeFilled());
+
+		// Step 0 diagnostic (per debugging guide): print payloadType/HasImageData
+		// for every buffer, not just the first, to confirm empirically whether
+		// EVT3.0 payload buffers ever expose buffer-level image timestamps on
+		// this camera/SDK/firmware combination. Capped to avoid flooding stdout
+		// on long recordings — gate with --debug-buffers [N] (default 20 lines).
+		if (g_debugBufferCount > 0)
+		{
+			std::cerr << "[debug] frameId=" << hdr.frameId
+				<< " payloadType=" << pBuffer->GetPayloadType()
+				<< " HasImageData=" << pBuffer->HasImageData()
+				<< " hasChunkData=" << pBuffer->HasChunkData()
+				<< " sizeFilled=" << hdr.payloadSize
+				<< std::endl;
+			--g_debugBufferCount;
+		}
+
+		// Branch B (confirmed via the Step-0 diagnostic above, and via grep
+		// against Arena/IBuffer.h: GetTimestampNs()/GetTimestamp() exist only on
+		// IImage and ICompressedImage, NOT on IBuffer itself): for this camera's
+		// EVT3.0 payload type, HasImageData() is false, so no buffer-level
+		// image timestamp is ever available here. hdr.timestampNs is therefore
+		// NOT a meaningful per-event (or even per-buffer) time source for this
+		// payload type — it is retained only as a monotonic ordering/gap-
+		// detection aid via hdr.frameId. The real per-event microsecond
+		// timestamp lives INSIDE the payload (EVT3.0 TIME_LOW/TIME_HIGH words),
+		// decoded offline in cevt_to_events.py — never reconstruct t from this
+		// field.
 		hdr.timestampNs = 0;
 
 		if (pBuffer->HasImageData())
@@ -851,7 +893,7 @@ struct Args
 {
 	std::string serial;
 	std::string eventFormatName;       // e.g. "EVT3_0" or "EVT2_1"
-	std::string eventFormatSizeName;   // e.g. "Bpe16" or "Bpe64" - optional
+	std::string eventFormatSizeName;   // e.g. "Bpe16" or "Bpe64" - REQUIRED for recording
 	std::string outputPath;
 	bool listEventFormats = false;
 	bool dumpNodes = false;
@@ -861,16 +903,14 @@ struct Args
 	double ercRateLimit = -1.0;   // -1 = don't touch; --erc-rate-limit <Mev/s>
 	std::string getIntNodeName; // e.g. "Width" or "Height" — --get-int diagnostic
 	std::string getEnumNodeName; // e.g. "TestPattern" — --get-enum diagnostic
-	// XYPT (sparse, real-timestamp) request — DEFAULT ON. See TryApplyOutputFormat's
-	// doc comment for why an unconfirmed node name is safe to default-enable: it
-	// degrades to a no-op + warning, never a crash, never silent wrong data.
-	std::string outputFormatNode = "EvsOutputFormat";  // override if --dump-nodes finds a different name
-	std::string outputFormatValue = "XYPT";
-	bool legacyCdFrame = false;   // --legacy-cdframe: skip the XYPT request entirely
+	std::string nodeInfoName;    // --node-info <Name>: access-mode + tooltip diagnostic
+	std::string setEnumName;     // --set-enum <Name>: direct enum write diagnostic
+	std::string setEnumValue;    // --set-enum-value <Value>: paired with setEnumName
 	uint64_t durationSeconds = 0; // 0 = run until SIGINT
 	size_t numBuffers = 64;
 	size_t queueSlots = 256;
 	uint64_t statsIntervalSeconds = 1;
+	int debugBuffers = 0;  // --debug-buffers [N]: print Step-0 per-buffer diagnostic for N buffers
 };
 
 void PrintUsage(const char* argv0)
@@ -888,20 +928,25 @@ void PrintUsage(const char* argv0)
 		"  --event-format <NAME>    Exact EventFormat symbolic name, e.g. EVT3_0 or\n"
 		"                           EVT2_1 (run --list-event-formats to confirm)\n"
 		"\n"
-		"Optional:\n"
+		"Required for recording (both — camera keeps a leftover value from the\n"
+		"previous session otherwise, e.g. a stale Bpe16 was seen surviving\n"
+		"across runs when this node wasn't explicitly touched):\n"
 		"  --event-format-size <NAME>  EventFormatSize symbolic name, e.g. Bpe16/Bpe64\n"
+		"\n"
+		"Optional:\n"
 		"  --serial <SN>            Select a specific camera when multiple are present\n"
 		"  --load-features <file>  Apply a saved bias/exposure profile (Arena::FeatureStream)\n"
 		"                           BEFORE recording, so one command = one fully specified\n"
 		"                           session, independent of whatever was last left on the\n"
 		"                           camera (e.g. via ArenaView)\n"
-		"  --output-format-node <Name>   Enum node to try for XYPT (default 'EvsOutputFormat')\n"
-		"  --output-format-value <Name>  Enum entry to request (default 'XYPT')\n"
-		"  --legacy-cdframe          Skip the XYPT request entirely; use whatever decode\n"
-		"                            mode the camera already has set (the ORIGINAL\n"
-		"                            behavior of this program, before XYPT support was\n"
-		"                            added — confirmed to produce dense CD Frame payloads\n"
-		"                            with a fabricated per-buffer timestamp)\n"
+		"  --debug-buffers [N]      Print a per-buffer Step-0 diagnostic (payloadType,\n"
+		"                           HasImageData, hasChunkData, sizeFilled) for the first\n"
+		"                           N buffers (default 20 if flag given with no value).\n"
+		"                           Use this to (re)confirm whether EVT3.0 payload buffers\n"
+		"                           ever expose a buffer-level image timestamp on this\n"
+		"                           camera/SDK combo — expected result: HasImageData=0\n"
+		"                           always, i.e. hdr.timestampNs is never meaningful for\n"
+		"                           this payload type (see comment in AcquisitionThreadFunc).\n"
 		"  --erc-rate-limit <Mev/s> Set ErcRateLimit (a FLOAT node) before recording. LUCID's\n"
 		"                           own recommendation for a 1GigE link is 40. NOTE: there is\n"
 		"                           NO node on this camera that counts events ERC silently\n"
@@ -922,6 +967,16 @@ void PrintUsage(const char* argv0)
 		"                           node on the main device node map (e.g. Width, Height), exit\n"
 		"  --get-enum <NodeName>    Connect, print the current symbolic value of any named\n"
 		"                           enum node (e.g. TestPattern, AcquisitionMode), exit\n"
+		"  --node-info <NodeName>   Connect, print IsAvailable/IsReadable/IsWritable plus\n"
+		"                           ToolTip/Description for any named node (no value read\n"
+		"                           or written), exit. Use this to find out WHY a node is\n"
+		"                           locked when --get-enum/--set-enum report not-readable/\n"
+		"                           not-writable — the camera's own ToolTip text sometimes\n"
+		"                           names the gating condition in plain English.\n"
+		"  --set-enum <NodeName> --set-enum-value <Value>\n"
+		"                           Connect, set one enum node directly (writable-check +\n"
+		"                           read-back-verify via the same path recording uses),\n"
+		"                           exit. For probing a node without a full recording run.\n"
 		"\n"
 		"Network tuning (best-effort, non-fatal if unavailable - see console output):\n"
 		"  attempts to enable 'StreamPacketResendEnable' and\n"
@@ -955,16 +1010,25 @@ bool ParseArgs(int argc, char** argv, Args& args, std::string& errorOut)
 			else if (a == "--filter") args.dumpNodesFilter = needValue("--filter");
 			else if (a == "--target") args.dumpNodesTarget = needValue("--target");
 			else if (a == "--load-features") args.loadFeaturesPath = needValue("--load-features");
-			else if (a == "--output-format-node") args.outputFormatNode = needValue("--output-format-node");
-			else if (a == "--output-format-value") args.outputFormatValue = needValue("--output-format-value");
-			else if (a == "--legacy-cdframe") args.legacyCdFrame = true;
 		else if (a == "--erc-rate-limit") args.ercRateLimit = std::stod(needValue("--erc-rate-limit"));
 		else if (a == "--get-int") args.getIntNodeName = needValue("--get-int");
 		else if (a == "--get-enum") args.getEnumNodeName = needValue("--get-enum");
+		else if (a == "--node-info") args.nodeInfoName = needValue("--node-info");
+		else if (a == "--set-enum") args.setEnumName = needValue("--set-enum");
+		else if (a == "--set-enum-value") args.setEnumValue = needValue("--set-enum-value");
 			else if (a == "--duration") args.durationSeconds = std::stoull(needValue("--duration"));
 			else if (a == "--num-buffers") args.numBuffers = std::stoull(needValue("--num-buffers"));
 			else if (a == "--queue-slots") args.queueSlots = std::stoull(needValue("--queue-slots"));
 			else if (a == "--stats-interval") args.statsIntervalSeconds = std::stoull(needValue("--stats-interval"));
+			else if (a == "--debug-buffers")
+			{
+				// Optional value: if the next token is a bare (non-flag) integer,
+				// consume it; otherwise default to 20 so `--debug-buffers` alone works.
+				if (i + 1 < argc && !std::string(argv[i + 1]).empty() && argv[i + 1][0] != '-')
+					args.debugBuffers = std::stoi(argv[++i]);
+				else
+					args.debugBuffers = 20;
+			}
 			else if (a == "--help" || a == "-h") { errorOut = ""; return false; }
 			else { errorOut = "Unknown argument: " + a; return false; }
 		}
@@ -975,7 +1039,7 @@ bool ParseArgs(int argc, char** argv, Args& args, std::string& errorOut)
 		}
 	}
 
-	if (!args.listEventFormats && !args.dumpNodes && args.getIntNodeName.empty() && args.getEnumNodeName.empty())
+	if (!args.listEventFormats && !args.dumpNodes && args.getIntNodeName.empty() && args.getEnumNodeName.empty() && args.nodeInfoName.empty() && args.setEnumName.empty())
 	{
 		if (args.outputPath.empty())
 		{
@@ -985,6 +1049,19 @@ bool ParseArgs(int argc, char** argv, Args& args, std::string& errorOut)
 		if (args.eventFormatName.empty())
 		{
 			errorOut = "--event-format is required (run --list-event-formats first)";
+			return false;
+		}
+		if (args.eventFormatSizeName.empty())
+		{
+			// Previously optional — promoted to required after observing that a
+			// leftover EventFormatSize value from a prior session (e.g. a stale
+			// Bpe16) survives on the camera when this node is never explicitly
+			// touched, and --get-enum after a run with the node unset showed
+			// exactly that: a value this recorder never set. Never let the
+			// camera's ambient state silently decide this.
+			errorOut = "--event-format-size is required (Bpe16 or Bpe64 — run "
+				"--list-event-formats first). Do not rely on whatever value the camera "
+				"happens to already have; it may be left over from a previous session.";
 			return false;
 		}
 	}
@@ -1086,6 +1163,56 @@ int main(int argc, char** argv)
 			return 0;
 		}
 
+		// --node-info <Name>: dump access mode + tooltip/description without
+		// reading or writing a value. Added specifically to investigate nodes
+		// that are present in --dump-nodes but return errors on --get-enum/
+		// --set-enum (e.g. AcquisitionAccumulationMode reporting "not
+		// readable"/"not writable") — this tells you WHY (IsAvailable/
+		// IsReadable/IsWritable) and often the camera's own ToolTip text names
+		// the gating condition in plain English.
+		if (!args.nodeInfoName.empty())
+		{
+			GenApi::CNodePtr pNode = pNodeMap->GetNode(args.nodeInfoName.c_str());
+			if (!pNode.IsValid())
+			{
+				std::cout << args.nodeInfoName << ": not found" << std::endl;
+			}
+			else
+			{
+				std::cout << std::boolalpha;
+				std::cout << args.nodeInfoName << ":\n"
+					<< "  IsAvailable = " << GenApi::IsAvailable(pNode) << "\n"
+					<< "  IsReadable  = " << GenApi::IsReadable(pNode) << "\n"
+					<< "  IsWritable  = " << GenApi::IsWritable(pNode) << "\n"
+					<< "  ToolTip     = " << pNode->GetToolTip() << "\n"
+					<< "  Description = " << pNode->GetDescription() << "\n";
+			}
+			pSystem->DestroyDevice(pDevice);
+			Arena::CloseSystem(pSystem);
+			return 0;
+		}
+
+		// --set-enum <Name> --set-enum-value <Value>: set a single enum node
+		// directly, without recording, reusing ApplyEnumIfPresent's writable-
+		// check + read-back-verify logic. Useful for probing whether a node
+		// that looks locked (IsWritable=false) actually accepts a write when
+		// tried directly, and for one-off experiments (e.g. trying
+		// AcquisitionAccumulationMode=EventBased) without a full recording run.
+		if (!args.setEnumName.empty())
+		{
+			if (args.setEnumValue.empty())
+			{
+				std::cerr << "Error: --set-enum requires --set-enum-value to also be specified." << std::endl;
+			}
+			else
+			{
+				ApplyEnumIfPresent(pNodeMap, args.setEnumName.c_str(), args.setEnumValue, /*required=*/true);
+			}
+			pSystem->DestroyDevice(pDevice);
+			Arena::CloseSystem(pSystem);
+			return 0;
+		}
+
 		// ── Recording path: register disconnect callback NOW ─────────
 		// Only reached when actually recording. Deregistered explicitly
 		// before DestroyDevice on both the success and failure paths below.
@@ -1094,21 +1221,14 @@ int main(int argc, char** argv)
 
 		LoadFeaturesIfRequested(pNodeMap, args.loadFeaturesPath);
 
+		// Both required (ParseArgs enforces this) and both now confirm-read-back
+		// after SetIntValue — see ApplyEnumIfPresent. This is the camera's ONE
+		// real, confirmed decode path; there is no XYPT request anymore (see
+		// the removed-TryApplyOutputFormat comment above SECTION 9/10 for why).
 		ApplyEnumIfPresent(pNodeMap, "EventFormat", args.eventFormatName, true);
-		if (!args.eventFormatSizeName.empty())
-			ApplyEnumIfPresent(pNodeMap, "EventFormatSize", args.eventFormatSizeName, true);
+		ApplyEnumIfPresent(pNodeMap, "EventFormatSize", args.eventFormatSizeName, true);
 
-		// XYPT request — DEFAULT ON (see TryApplyOutputFormat doc comment). Must
-		// happen before StartStream, same as EventFormat above. Non-fatal either way.
-		if (args.legacyCdFrame)
-		{
-			std::cout << "[output-format] --legacy-cdframe set: not requesting XYPT, "
-				<< "using the camera's current decode setting as-is." << std::endl;
-		}
-		else
-		{
-			TryApplyOutputFormat(pNodeMap, args.outputFormatNode, args.outputFormatValue);
-		}
+		g_debugBufferCount = args.debugBuffers;
 
 		SetStreamBufferHandlingModeOldestFirst(pTLStreamNodeMap);
 

@@ -319,8 +319,10 @@ def normalize_events(arr, width: int, height: int, dur_us_hint: float):
 
     print(f"  [norm] suy cột: t=c{t_col}({unit})  x=c{x_col}  y=c{y_col}  p=c{p_col}"
           f"   |  {len(t):,} events, {t.max()/1e6 - t.min()/1e6:.2f}s")
-    return dict(x=a[order, x_col].astype(np.uint16),
-                y=a[order, y_col].astype(np.uint16),
+    x = np.clip(np.rint(a[order, x_col]), 0, width - 1).astype(np.uint16)
+    y = np.clip(np.rint(a[order, y_col]), 0, height - 1).astype(np.uint16)
+    return dict(x=x,
+                y=y,
                 t=t[order].astype(np.uint64),
                 p=p[order])
 

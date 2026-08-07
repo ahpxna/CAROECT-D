@@ -1,0 +1,30 @@
+# ── Core (preprocess / calibrate / event I/O) ──────────────────────
+opencv-python>=4.8.0
+numpy>=1.24.0,<2        # DVS-Voltmeter env pins numpy<2 (ABI cũ, xem setup_sim.sh) — giữ toàn bộ
+                         # project cùng 1 numpy major version để tránh lệch ABI khi trộn env
+tifffile>=2023.1.0
+PyYAML>=6.0
+h5py>=3.8.0
+
+# ── Label transfer / dataset / visualize ────────────────────────────
+matplotlib>=3.7.0        # visualize_geometry_error.py (biểu đồ radial error)
+
+# ── Train / eval ─────────────────────────────────────────────────────
+ultralytics>=8.1.0       # train_event_yolo.py / eval_event_yolo.py
+
+# ── Calibrate simulator (tuỳ chọn) ──────────────────────────────────
+optuna>=3.5.0            # CHỈ cần nếu dùng calibrate_simulator.py --optuna; cài vào env
+                          # đang chạy chính calibrate_simulator.py (host/base env), KHÔNG
+                          # phải env v2e/dvsvolt (2 env đó chỉ gọi qua subprocess)
+
+# ── KHÔNG cài ở đây (cài riêng theo hướng dẫn của từng repo) ────────
+# v2e             -> setup_sim.sh (env conda riêng, python 3.10)
+# DVS-Voltmeter   -> setup_sim.sh (env conda riêng, python 3.9, opencv==4.5.1.48 pin cũ)
+# SAM3            -> facebookresearch/sam3, xem test_sam3.py / sam3_export_tracks.py
+# Arena SDK       -> build_linux.sh (C++ binding, không phải pip package)
+
+# ── ĐÃ GỠ / nên xoá khỏi repo (xem review) ──────────────────────────
+# metavision-sdk-base  -> chỉ record_evs.py/read_evt3.py cần (nhánh Metavision/LUCID-HAL
+#                          đã bị bỏ hẳn, evs_recorder.cpp thay thế hoàn toàn — 2 file đó
+#                          và cevt_to_h5.py (payload dense-only, timestamp bịa) nên archive
+#                          hoặc xoá khỏi thư mục chạy để tránh gọi nhầm)

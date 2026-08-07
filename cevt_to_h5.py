@@ -2,6 +2,17 @@
 """
 cevt_to_h5.py — Convert CAROECT-D recordings to the unified events.h5 schema.
 
+⚠ DEPRECATED — superseded by cevt_to_events.py.
+This script only ever tries ONE hypothesis (dense accumulated frame) and
+falls back to a fabricated frame_idx*fps timestamp for any record that
+isn't exactly width*height bytes — which is now known to be wrong for
+EVT3.0 payload records (the camera's confirmed real format; see
+evs_recorder.cpp). cevt_to_events.py tries dense-frame AND real EVT3.0
+word decode (with a --debug-time-continuity diagnostic for the real t),
+and is now the one converter used by run_pipeline.sh's `real` command.
+Kept here only for re-inspecting old recordings / comparison — do not
+wire this into new pipeline runs.
+
 UNIFIED SCHEMA (same as run_v2e.py / run_dvsvolt.py output, same as read_evt3.py):
   events.h5
     /events/x     uint16  [N]      pixel column

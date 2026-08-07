@@ -98,6 +98,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import tifffile
 import yaml
 
 try:
@@ -129,6 +130,24 @@ RUNNERS = {
 def load_config(path):
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _h5_attr_to_str(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def check_timestamp_precision(real_h5: Path, require_precise: bool):
+    with h5py.File(real_h5, "r") as hf:
+        status = _h5_attr_to_str(hf.attrs.get("timestamp_precision_status", "unknown"))
+        zero_dt = float(hf.attrs.get("timestamp_zero_dt_fraction", 0.0))
+    if require_precise and status not in {"precise", "unknown"}:
+        raise RuntimeError(
+            f"{real_h5} có timestamp_precision_status={status!r}, "
+            f"zero_dt_fraction={zero_dt:.4f}. Không dùng file này cho Eq.23/timing "
+            f"calibration; record ngắn hơn hoặc dùng raw EVT3/Bpe64 giữ uint64 timestamp.")
+    return status, zero_dt
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -212,6 +231,152 @@ def slice_real_to_window(real_h5: Path, duration_s: float, sensor_w: int, sensor
     return stats
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  N3b · Eq.23 physical contrast-threshold calibration
+# ══════════════════════════════════════════════════════════════════════════
+
+def sorted_tiff_paths(folder: Path):
+    exts = ("*.tif", "*.tiff", "*.png")
+    paths = []
+    for ext in exts:
+        paths.extend(folder.glob(ext))
+    return sorted(paths)
+
+
+def read_linear_luma(path: Path, cfg: dict) -> np.ndarray:
+    img = tifffile.imread(str(path)).astype(np.float32)
+    if img.ndim == 2:
+        return img
+    coeffs = np.asarray(cfg.get("camera", {}).get("luma_coeffs", [0.2627, 0.6780, 0.0593]),
+                        dtype=np.float32)
+    return np.tensordot(img[..., :3], coeffs, axes=([-1], [0])).astype(np.float32)
+
+
+def count_interval_events(events: dict, t0: float, t1: float, width: int, height: int):
+    lo = int(np.searchsorted(events["t"], t0, side="left"))
+    hi = int(np.searchsorted(events["t"], t1, side="left"))
+    x = events["x"][lo:hi].astype(np.int64)
+    y = events["y"][lo:hi].astype(np.int64)
+    p = events["p"][lo:hi] > 0
+    valid = (0 <= x) & (x < width) & (0 <= y) & (y < height)
+    x, y, p = x[valid], y[valid], p[valid]
+
+    on = np.zeros((height, width), dtype=np.uint16)
+    off = np.zeros((height, width), dtype=np.uint16)
+    if len(x):
+        np.add.at(on, (y[p], x[p]), 1)
+        np.add.at(off, (y[~p], x[~p]), 1)
+    return on, off
+
+
+def estimate_eq23_thresholds(real_h5: Path, frame_dir: Path, cfg: dict, limit: int,
+                             min_dlog: float, min_events: int, time_offset_us: float = 0.0):
+    """Estimate C_real = ΔlogL / Nbar(ΔlogL) from a calibrated gray-gradient/ramp clip.
+
+    For each adjacent frame pair, compute per-pixel ΔlogL, count real ON/OFF
+    events in the matching timestamp interval, then use the paper's physical
+    relation: expected event count ≈ |ΔlogL| / C. Summing over active pixels
+    gives robust ON/OFF threshold estimates.
+    """
+    events = load_events_h5(real_h5)
+    if len(events["t"]) == 0:
+        raise ValueError(f"{real_h5} rỗng — không estimate Eq.23 được.")
+
+    paths = sorted_tiff_paths(frame_dir)
+    if len(paths) < 2:
+        raise FileNotFoundError(f"Cần >=2 TIFF/PNG frame trong {frame_dir} cho Eq.23.")
+    if limit:
+        paths = paths[:max(2, min(limit, len(paths)))]
+
+    fps = float(cfg["camera"]["fps_original"])
+    width, height = int(cfg["camera"]["width"]), int(cfg["camera"]["height"])
+    eps = 1.0
+    t_origin = float(events["t"].min()) + float(time_offset_us)
+
+    total_pos_dlog = 0.0
+    total_neg_dlog = 0.0
+    total_on = 0
+    total_off = 0
+    rows = []
+
+    prev = read_linear_luma(paths[0], cfg)
+    if prev.shape != (height, width):
+        raise ValueError(f"{paths[0]} shape={prev.shape}, config camera={height}x{width}")
+
+    for i in range(len(paths) - 1):
+        nxt = read_linear_luma(paths[i + 1], cfg)
+        if nxt.shape != prev.shape:
+            raise ValueError(f"Frame shape mismatch: {paths[i]} {prev.shape} vs {paths[i+1]} {nxt.shape}")
+
+        dlog = np.log(np.clip(nxt, eps, None)) - np.log(np.clip(prev, eps, None))
+        pos_pixels = dlog > min_dlog
+        neg_pixels = dlog < -min_dlog
+        t0 = t_origin + i * 1e6 / fps
+        t1 = t_origin + (i + 1) * 1e6 / fps
+        on, off = count_interval_events(events, t0, t1, width, height)
+
+        pos_dlog = float(dlog[pos_pixels].sum())
+        neg_dlog = float((-dlog[neg_pixels]).sum())
+        n_on = int(on[pos_pixels].sum())
+        n_off = int(off[neg_pixels].sum())
+
+        if n_on >= min_events and pos_dlog > 0:
+            c_pos = pos_dlog / n_on
+            total_pos_dlog += pos_dlog
+            total_on += n_on
+        else:
+            c_pos = None
+        if n_off >= min_events and neg_dlog > 0:
+            c_neg = neg_dlog / n_off
+            total_neg_dlog += neg_dlog
+            total_off += n_off
+        else:
+            c_neg = None
+        rows.append(dict(
+            frame_i=i,
+            t_start_us=t0,
+            t_end_us=t1,
+            pos_delta_log=pos_dlog,
+            neg_delta_log=neg_dlog,
+            n_on=n_on,
+            n_off=n_off,
+            c_pos=c_pos,
+            c_neg=c_neg,
+        ))
+        prev = nxt
+
+    c_pos = total_pos_dlog / total_on if total_on >= min_events and total_pos_dlog > 0 else None
+    c_neg = total_neg_dlog / total_off if total_off >= min_events and total_neg_dlog > 0 else None
+    return dict(
+        method="Eq23_C_real_delta_logL_over_event_count",
+        frame_dir=str(frame_dir),
+        real_h5=str(real_h5),
+        fps=fps,
+        min_dlog=min_dlog,
+        min_events=min_events,
+        total_pos_delta_log=total_pos_dlog,
+        total_neg_delta_log=total_neg_dlog,
+        total_on_events=total_on,
+        total_off_events=total_off,
+        c_pos=c_pos,
+        c_neg=c_neg,
+        rows=rows,
+    )
+
+
+def apply_eq23_to_config(cfg: dict, simulator: str, estimate: dict):
+    out = copy.deepcopy(cfg)
+    if simulator != "v2e":
+        raise ValueError("Eq.23 apply trực tiếp hiện chỉ map sang v2e pos_thres/neg_thres. "
+                         "DVS-Voltmeter dùng estimate này làm physical target, còn k1..k6 "
+                         "vẫn tune bằng closed-loop search.")
+    if estimate["c_pos"] is not None:
+        out["v2e"]["pos_thres"] = float(estimate["c_pos"])
+    if estimate["c_neg"] is not None:
+        out["v2e"]["neg_thres"] = float(estimate["c_neg"])
+    return out
+
+
 def run_optuna_search(simulator: str, param: str, low: float, high: float, n_trials: int,
                        base_cfg: dict, sim_input: Path, work_dir: Path, limit: int,
                        W: int, H: int, duration_s: float, real_stats: dict):
@@ -279,14 +444,25 @@ def score_candidate(sim_stats: dict, real_stats: dict) -> float:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--real", required=True, help="events_real.h5 (từ cevt_to_events.py)")
+    ap.add_argument("--real", required=True, help="events_real.h5 (từ xypt_to_h5.py/cevt_to_events.py)")
     ap.add_argument("--sim-input", required=True,
                     help="Thư mục TIFF 16-bit (output nhánh Y của preprocess.py), cùng "
                          "cảnh cùng lúc với --real")
     ap.add_argument("--simulator", required=True, choices=["dvsvolt", "v2e"])
-    ap.add_argument("--param", required=True,
+    ap.add_argument("--param", default=None,
                     help="dvsvolt: k1..k6 | v2e: pos_thres,neg_thres,sigma_thres,"
                          "cutoff_hz,leak_rate_hz,shot_noise_rate_hz")
+    ap.add_argument("--eq23", action="store_true",
+                    help="Estimate physical contrast threshold C_real = ΔlogL/Nbar(ΔlogL) "
+                         "from a gray-gradient/ramp clip in --sim-input.")
+    ap.add_argument("--eq23-output", default=None,
+                    help="JSON report path for --eq23 (default: <work-dir>/eq23_estimate.json).")
+    ap.add_argument("--eq23-min-dlog", type=float, default=1e-3,
+                    help="Ignore per-pixel |ΔlogL| below this value.")
+    ap.add_argument("--eq23-min-events", type=int, default=10,
+                    help="Minimum ON/OFF events needed before reporting/applying a threshold.")
+    ap.add_argument("--time-offset-us", type=float, default=0.0,
+                    help="Offset added to real event t_min when aligning frame i to event time.")
     ap.add_argument("--search", type=float, nargs="+",
                     help="Danh sách giá trị ứng viên cho --param (default nếu không dùng --optuna)")
     ap.add_argument("--optuna", action="store_true",
@@ -299,12 +475,49 @@ def main():
                     help="Số frame đầu dùng để search (mặc định 120 ~1s @119.88fps)")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--work-dir", default="_calib_work")
+    ap.add_argument("--require-precise-t", action="store_true", default=True,
+                    help="Refuse Eq.23/timing calibration if H5 timestamp metadata says degraded.")
+    ap.add_argument("--allow-degraded-t", action="store_false", dest="require_precise_t",
+                    help="Override timestamp precision guardrail.")
     ap.add_argument("--apply", action="store_true",
                     help="Ghi giá trị tốt nhất vào config.yaml (có backup .bak trước khi ghi)")
     args = ap.parse_args()
 
     if h5py is None:
         raise ImportError("pip install h5py")
+
+    base_cfg = load_config(args.config)
+    real_path = Path(args.real)
+    ts_status, zero_dt = check_timestamp_precision(real_path, args.require_precise_t and args.eq23)
+    print(f"events_real.h5 timestamp_precision_status = {ts_status} "
+          f"(zero_dt_fraction={zero_dt:.4f})")
+
+    work_dir = Path(args.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.eq23:
+        estimate = estimate_eq23_thresholds(
+            real_path, Path(args.sim_input), base_cfg, args.limit,
+            args.eq23_min_dlog, args.eq23_min_events, args.time_offset_us)
+        out_path = Path(args.eq23_output) if args.eq23_output else work_dir / "eq23_estimate.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(estimate, indent=2))
+        print(f"\n{'='*72}\nEq.23 physical calibration\n{'='*72}")
+        print(f"  C_pos = {estimate['c_pos']}  from {estimate['total_on_events']:,} ON events")
+        print(f"  C_neg = {estimate['c_neg']}  from {estimate['total_off_events']:,} OFF events")
+        print(f"  report -> {out_path}")
+        if args.apply:
+            cfg_path = Path(args.config)
+            backup = cfg_path.with_suffix(cfg_path.suffix + ".bak")
+            shutil.copy(cfg_path, backup)
+            final_cfg = apply_eq23_to_config(base_cfg, args.simulator, estimate)
+            with open(cfg_path, "w") as f:
+                yaml.safe_dump(final_cfg, f, sort_keys=False, allow_unicode=True)
+            print(f"✓ Đã ghi Eq.23 thresholds vào {cfg_path} (backup: {backup})")
+        return
+
+    if args.param is None:
+        raise ValueError("Cần --param cho closed-loop search, hoặc dùng --eq23.")
 
     if args.optuna:
         if args.low is None or args.high is None:
@@ -319,24 +532,20 @@ def main():
         raise ValueError(f"--param '{args.param}' không hợp lệ cho simulator="
                           f"{args.simulator}. Hợp lệ: {sorted(valid_params)}")
     if args.param in timing_only:
+        check_timestamp_precision(real_path, args.require_precise_t)
         print(f"[warning] '{args.param}' thuộc nhóm ảnh hưởng NOISE/JITTER thời gian, "
               "không đáng tin nếu events_real.h5 dùng timestamp bịa (decode_method=dense). "
               "Kiểm tra attrs['decode_method_counts'] của file trước khi tin kết quả này.\n")
 
-    base_cfg = load_config(args.config)
     fps = float(base_cfg["camera"]["fps_original"])
     W, H = int(base_cfg["camera"]["width"]), int(base_cfg["camera"]["height"])
     duration_s = args.limit / fps
 
-    real_path = Path(args.real)
     with h5py.File(real_path, "r") as hf:
         decode_counts = hf.attrs.get("decode_method_counts", "unknown")
     print(f"events_real.h5 decode_method_counts = {decode_counts}\n")
 
     real_stats = slice_real_to_window(real_path, duration_s, W, H)
-
-    work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
 
     mode_desc = (f"optuna TPE, {args.n_trials} trial(s) in [{args.low}, {args.high}]"
                  if args.optuna else f"{len(args.search)} candidate(s) (grid)")

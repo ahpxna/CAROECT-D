@@ -63,7 +63,9 @@ def load_sorted_frame_paths(folder: str):
     """Same loading/sorting logic as the official notebook's Cell 13 -
     integer sort on '<frame_index>.jpg', falling back to lexicographic sort
     (with a warning) if names don't match that pattern."""
-    paths = glob.glob(os.path.join(folder, "*.jpg"))
+    paths = []
+    for ext in ("*.jpg", "*.jpeg", "*.png"):
+        paths.extend(glob.glob(os.path.join(folder, ext)))
     try:
         paths.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
     except ValueError:

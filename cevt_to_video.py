@@ -21,11 +21,16 @@ Whichever hypothesis wins for a given record, this script logs it, so after
 one run we'll know empirically which records are dense and which are sparse
 — and get a video either way.
 
-⚠ TIMING CAVEAT: every RecordHeader.timestampNs in this recording was 0 (see
-inspect_cevt.py output), so we have NO real per-record capture time. Playback
-uses a fixed --fps you choose (default 15) — the video's timing is NOT
-physically accurate to the original capture rate. Treat this purely as a
-visual sanity check, not a timing-correct reconstruction.
+⚠ TIMING CAVEAT: every RecordHeader.timestampNs in this recording was 0 — this is now
+CONFIRMED expected behavior, not a bug (see evs_recorder.cpp's Branch-B comment and the
+Step-0 --debug-buffers diagnostic: HasImageData()==false for this camera's EVT3.0
+payload buffers, and Arena/IBuffer.h has no GetTimestampNs()/GetTimestamp() of its own —
+those exist only on IImage/ICompressedImage). So we have NO real per-record capture time
+from the RecordHeader. Playback here uses a fixed --fps you choose (default 15) — the
+video's timing is NOT physically accurate to the original capture rate. Treat this
+purely as a visual sanity check, not a timing-correct reconstruction. The REAL per-event
+microsecond timestamp lives inside each EVT3.0 payload (TIME_LOW/TIME_HIGH words) and is
+decoded properly by cevt_to_events.py, not by this script.
 
 Usage:
     pip install opencv-python numpy   # if not already installed

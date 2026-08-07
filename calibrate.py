@@ -34,25 +34,46 @@ def load_config(path="config.yaml"):
         return yaml.safe_load(f)
 
 
+def decode_transfer(rgb: np.ndarray, transfer: str) -> np.ndarray:
+    """Match preprocess.py: convert encoded TIFF values to scene-linear 0..65535."""
+    if transfer == "linear":
+        return rgb
+    if transfer == "srgb":
+        n = np.clip(rgb / 65535.0, 0.0, 1.0)
+        lin = np.where(n <= 0.04045, n / 12.92, ((n + 0.055) / 1.055) ** 2.4)
+        return (lin * 65535.0).astype(np.float32)
+    raise ValueError(f"camera.input_transfer must be 'linear' or 'srgb', got {transfer!r}")
+
+
+def read_tiff_linear(path: str | Path, transfer: str) -> np.ndarray:
+    img = tifffile.imread(str(path)).astype(np.float32)
+    if img.ndim == 3:
+        return decode_transfer(img, transfer)
+    if transfer != "linear":
+        return decode_transfer(img[..., np.newaxis], transfer)[..., 0]
+    return img
+
+
 # ── Dark frame  -> dark_mean.npy ──────────────────────────────────
-def compute_dark_mean(dark_dir: str) -> np.ndarray:
+def compute_dark_mean(dark_dir: str, transfer: str = "linear") -> np.ndarray:
     """Average lens-cap frames to estimate the sensor's fixed noise/bias floor."""
     paths = sorted(Path(dark_dir).glob("*.tiff"))
     if not paths:
         raise FileNotFoundError(f"No .tiff files in {dark_dir}")
-    stack = np.stack([tifffile.imread(str(p)).astype(np.float32) for p in paths])
+    stack = np.stack([read_tiff_linear(p, transfer) for p in paths])
     mean = np.mean(stack, axis=0)
     print(f"  [Dark]  {len(paths)} frames  |  baseline mean: {mean.mean():.1f}")
     return mean
 
 
 # ── Flat field  -> gain_map.npy ───────────────────────────────────
-def compute_gain_map(flat_dir: str, dark_mean: np.ndarray = None) -> np.ndarray:
+def compute_gain_map(flat_dir: str, dark_mean: np.ndarray = None,
+                     transfer: str = "linear") -> np.ndarray:
     """Per-pixel gain from a uniform scene = mean(flat) / flat. Removes vignetting."""
     paths = sorted(Path(flat_dir).glob("*.tiff"))
     if not paths:
         raise FileNotFoundError(f"No .tiff files in {flat_dir}")
-    stack = np.stack([tifffile.imread(str(p)).astype(np.float32) for p in paths])
+    stack = np.stack([read_tiff_linear(p, transfer) for p in paths])
     flat = np.mean(stack, axis=0)
     flat = flat - dark_mean if dark_mean is not None else flat
     flat = np.clip(flat, 1.0, None)                 # avoid divide-by-zero only
@@ -62,9 +83,9 @@ def compute_gain_map(flat_dir: str, dark_mean: np.ndarray = None) -> np.ndarray:
 
 
 # ── White balance  -> wb_gains.npy ────────────────────────────────
-def compute_wb_gains(gray_card_path: str, roi=None) -> np.ndarray:
+def compute_wb_gains(gray_card_path: str, roi=None, transfer: str = "linear") -> np.ndarray:
     """Per-channel gains from a gray card, normalized to the G channel."""
-    img = tifffile.imread(str(gray_card_path)).astype(np.float32)
+    img = read_tiff_linear(gray_card_path, transfer)
     patch = img[roi[1]:roi[1]+roi[3], roi[0]:roi[0]+roi[2]] if roi else img
     r, g, b = patch[:, :, 0].mean(), patch[:, :, 1].mean(), patch[:, :, 2].mean()
     gains = np.array([g / r if r > 0 else 1.0, 1.0, g / b if b > 0 else 1.0], np.float32)
@@ -115,27 +136,29 @@ def run(cfg):
     calib_dir = Path(cfg["paths"]["calibration_dir"])
     calib_dir.mkdir(parents=True, exist_ok=True)
     c = cfg["calibration"]
+    transfer = cfg.get("camera", {}).get("input_transfer", "linear")
 
     print(f"\n{'━'*45}\n  CAROECT-D Calibration\n{'━'*45}")
+    print(f"  [Transfer] calibration TIFFs interpreted as {transfer!r}, same as footage")
 
     dark_mean = None
     dark_path = calib_dir / "dark"
     if dark_path.exists() and any(dark_path.glob("*.tiff")):
-        dark_mean = compute_dark_mean(str(dark_path))
+        dark_mean = compute_dark_mean(str(dark_path), transfer)
         np.save(calib_dir / "dark_mean.npy", dark_mean)
     else:
         print("  [Dark]  skipped (no frames)")
 
     flat_path = calib_dir / "flat"
     if flat_path.exists() and any(flat_path.glob("*.tiff")):
-        np.save(calib_dir / "gain_map.npy", compute_gain_map(str(flat_path), dark_mean))
+        np.save(calib_dir / "gain_map.npy", compute_gain_map(str(flat_path), dark_mean, transfer))
     else:
         print("  [Flat]  skipped (no frames)")
 
     gray_card = calib_dir / "gray_card.tiff"
     if gray_card.exists():
         roi = c.get("gray_card_roi")
-        gains = compute_wb_gains(str(gray_card), roi)
+        gains = compute_wb_gains(str(gray_card), roi, transfer)
         np.save(calib_dir / "wb_gains.npy", gains)
 
         # ── Exposure normalization (reuses the SAME gray card shot) ──────
@@ -154,7 +177,7 @@ def run(cfg):
         # overwritten again). Every later session computes its own
         # exposure_level.npy; preprocess.py multiplies every pixel by
         # (exposure_target / exposure_level) to match the reference session.
-        img = tifffile.imread(str(gray_card)).astype(np.float32)
+        img = read_tiff_linear(gray_card, transfer)
         patch = img[roi[1]:roi[1]+roi[3], roi[0]:roi[0]+roi[2]] if roi else img
         wb_patch = patch * gains[np.newaxis, np.newaxis, :]
         exposure_level = float(wb_patch.mean())
