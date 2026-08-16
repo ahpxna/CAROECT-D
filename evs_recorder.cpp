@@ -1,1463 +1,793 @@
 // ============================================================================
-//  evs_recorder.cpp
-//  Standalone long-duration recorder for LUCID Triton2 EVS (TRT009S-EC)
-//  Replaces ArenaView's recording function, which crashes on this camera.
+//  evs_recorder.cpp   (renamed from evs_recorder_mv.cpp -- see note below)
+//  Long-duration SPARSE event recorder for LUCID Triton2 EVS (TRT009S-EC)
+//  via Metavision SDK / OpenEB 4.6.2 + LUCID's HAL plugin.
 //
-//  Built using ONLY Arena SDK C++ APIs (namespace Arena). No Metavision SDK.
+//  RENAME NOTE: this file used to be named evs_recorder_mv.cpp, living
+//  alongside a DIFFERENT evs_recorder.cpp (Arena SDK, DENSE accumulated
+//  frames, .cevt). That Arena-based file is now RETIRED to legacy/
+//  (legacy/evs_recorder.cpp) because Arena SDK cannot deliver sparse events
+//  on this camera at all (see below) -- this file, the Metavision one, is
+//  now the ONLY active recorder and took over the plain "evs_recorder.cpp"
+//  name. build_linux.sh (renamed from build_mv.sh) builds this file into a
+//  binary named `evs_recorder` (not `evs_recorder_mv`) by default now.
 //
-//  Every Arena/GenApi call used below is backed by a specific header citation
-//  in the accompanying report (Phase 1/2). Where the exact behavior could NOT
-//  be confirmed from the provided Include.zip (GenApi/GenICam headers were
-//  not part of that zip; standard GigE Vision packet-size/resend node names
-//  are not hardcoded anywhere in Arena's own headers), this is called out
-//  explicitly in comments rather than silently assumed.
+//    evs_recorder.cpp (THIS FILE)     Metavision -> SPARSE (x,y,p,t) events (.raw)
+//    legacy/evs_recorder.cpp (RETIRED) Arena SDK  -> DENSE accumulated frames (.cevt)
 //
-//  WHAT THIS RECORDER WRITES:
-//    A custom binary container, NOT the Prophesee EVT3.0 wire format.
-//    Arena SDK already hands you DECODED events (see Phase 2 of the report):
-//    every buffer's raw bytes are an array of either
-//      struct LucidXYTPPixel     { float x,y,t,p; }              (16 B/event)
-//      struct EvsRawDecodedEvent { uint16 x,y; int16 p; uint64 ts;} (14 B/event)
-//    This recorder does NOT try to interpret those bytes at capture time -
-//    it only ever copies them verbatim, as fast as possible, alongside a
-//    small per-buffer header (frame id, timestamp, size). Interpretation
-//    into (x,y,t,p) arrays happens OFFLINE in Python (see Phase 5 of the
-//    report), where mistakes are cheap to fix without re-running a live
-//    camera. This keeps the hot path "dumb and fast", which is what a
-//    never-block, never-crash recorder needs.
+//  WHY THIS FILE EXISTS
+//  --------------------
+//  On this camera, Arena SDK cannot deliver sparse events. That is a
+//  firmware/GenICam limit, not a code bug, and it was established the hard
+//  way: AcquisitionAccumulationMode (TimeBased/EventBased) is present on the
+//  device node map but reports IsAvailable=false / IsReadable=false /
+//  IsWritable=false; over 2160 nodes were swept for an unlock path and none
+//  exists. Every Arena buffer is a dense width*height accumulated frame, so
+//  sub-window event ordering is destroyed inside the camera and no honest
+//  per-event microsecond timestamp can be recovered offline.
+//
+//  Metavision HAL bypasses that abstraction entirely and was CONFIRMED
+//  working on this machine by probe_metavision.cpp, which printed 500 real
+//  sparse events with microsecond timestamps. This recorder is the
+//  production version of that probe.
+//
+//  WHAT THIS RECORDER WRITES
+//  -------------------------
+//  A standard Prophesee .raw file, written by the SDK itself via
+//  Camera::start_recording(). Deliberately NOT a custom container this time:
+//  the SDK's writer runs on its own thread (documented in camera.h as the
+//  recommended way to save a recording, explicitly noted as not slowing the
+//  decoding thread, unlike I_EventsStream::log_raw_data), and .raw is the
+//  format the rest of the event-vision ecosystem already reads. That removes
+//  a whole class of self-inflicted format bugs and removes the need for a
+//  cevt_to_events.py equivalent on this path.
+//
+//  The CD callback registered below is for LIVE STATISTICS ONLY (event
+//  count / rate / polarity split). It is deliberately not the write path.
+//  Keeping it arithmetic-only means it cannot become a bottleneck that
+//  causes the SDK to drop events.
+//
+//  A sidecar <output>.meta.json is written next to the .raw with camera
+//  serial, plugin, geometry, bias values actually in effect, ERC state, and
+//  host wall-clock start/stop — everything needed later to reproduce or
+//  interpret the recording without guesswork.
+//
+//  API VERIFICATION
+//  ----------------
+//  Every Metavision call below was checked against the OpenEB 4.6.2 headers
+//  (the exact version of the .so files LUCID bundles in
+//  ArenaSDK_Linux_x64/Metavision/lib, confirmed via `strings`):
+//    Camera::from_first_available() / from_serial()  camera.h:181,239
+//    Camera::cd().add_callback(EventsCDCallback)     cd.h:44
+//    Camera::start()/stop()/is_running()             camera.h:374
+//    Camera::start_recording()/stop_recording()      camera.h:402,412
+//    Camera::biases() -> Biases&                     camera.h:342
+//    Biases::set_from_file()/save_to_file()          biases.h:34,38
+//    Biases::get_facility() -> I_LL_Biases*          biases.h:41
+//    I_LL_Biases::get_all_biases()                   i_ll_biases.h:53
+//    Camera::get_device() -> Device&                 camera.h:450
+//    Device::get_facility<T>() -> T* (may be null)   device.h:31
+//    I_ErcModule::enable/is_enabled/set_cd_event_rate i_erc_module.h:30,34,43
+//    I_Geometry::get_width()/get_height()            i_geometry.h:24,28
+//    I_HW_Identification::get_serial()               i_hw_identification.h:69
+//    EventCD fields x,y,p,t (unsigned short/short/timestamp) event2d.h:33-49
+//
+//  KNOWN SDK TEARDOWN BUG — WHY THIS EXITS VIA _Exit()
+//  ---------------------------------------------------
+//  probe_metavision.cpp completed successfully (all 500 events printed, clean
+//  "Capture complete") and THEN aborted with:
+//      terminate called after throwing an instance of
+//      'boost::wrapexcept<boost::lock_error>'
+//      what(): boost: mutex lock failed in pthread_mutex_lock: Invalid argument
+//  That fires during static/global destruction inside the bundled Metavision
+//  libraries, after all user work is finished. It does not affect captured
+//  data. But a recorder that core-dumps on every exit is unusable in
+//  unattended long runs (it pollutes logs and makes the exit code lie about
+//  whether the recording succeeded), so once the .raw is closed and the
+//  sidecar is flushed, this program leaves via std::_Exit(0), which skips
+//  those destructors by design. See ExitNow().
+//
+//  BUILD
+//    bash build_linux.sh         (renamed from build_mv.sh; see companion script)
+//
+//  TYPICAL USE
+//    ./evs_recorder --output run01.raw --duration 60
+//    ./evs_recorder --output run02.raw --bias-file night.bias --erc-rate 40000000
+//    ./evs_recorder --info
+//    ./evs_recorder --output x.raw --save-bias current.bias --duration 5
 // ============================================================================
 
-// NOMINMAX: Windows only — windows.h (pulled in by Arena SDK on Windows) would
-// #define min/max as macros, swallowing std::max calls. Not needed on Linux/macOS.
-#ifdef _WIN32
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#endif
-
-#include <Arena/ArenaApi.h>
-
-#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdint>
-#include <cstring>
 #include <csignal>
+#include <cstdint>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <thread>
-#include <vector>
 
-// ============================================================================
-// SECTION 0 — Global shutdown flag + signal handling
-// ============================================================================
-// A single atomic<bool> is the only thing the signal handler touches. Both
-// worker threads poll it. This is the standard, safe pattern for graceful
-// shutdown in C++: signal handlers must not do anything non-trivial (no
-// I/O, no locks, no allocation), so all it does is flip a flag.
-// ----------------------------------------------------------------------------
+#include <metavision/sdk/base/events/event_cd.h>
+#include <metavision/sdk/driver/camera.h>
+#include <metavision/sdk/driver/camera_exception.h>
+#include <metavision/hal/facilities/i_erc_module.h>
+#include <metavision/hal/facilities/i_geometry.h>
+#include <metavision/hal/facilities/i_hw_identification.h>
+#include <metavision/hal/facilities/i_ll_biases.h>
 
-std::atomic<bool> g_stopRequested{ false };
+// ---------------------------------------------------------------------------
+// SECTION 0 — signal handling
+//
+// Async-signal-safe rule: a handler may only touch a volatile sig_atomic_t /
+// lock-free atomic. No printing, no camera calls, no allocation in here. The
+// main loop polls this flag and does the actual shutdown.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_stopRequested{false};
 
-// Countdown for the Step-0 per-buffer diagnostic (see AcquisitionThreadFunc).
-// Not atomic: only ever touched from the single acquisition thread.
-// Set from --debug-buffers [N] (default N=20 when the flag is passed bare).
-int g_debugBufferCount = 0;
-
-void SignalHandler(int /*signum*/)
+extern "C" void HandleSignal(int)
 {
 	g_stopRequested.store(true, std::memory_order_relaxed);
 }
 
-// ============================================================================
-// SECTION 1 — On-disk container format (CAROECT-D custom format)
-// ============================================================================
-// IMPORTANT: this is NOT the Prophesee EVT3.0 raw wire format. It is a
-// minimal, self-describing container designed so that nothing about the
-// capture is lost or guessed at write time. All interpretation of the event
-// payload bytes (casting to LucidXYTPPixel / EvsRawDecodedEvent) is deferred
-// to the offline Python converter described in Phase 5 of the report.
+// ---------------------------------------------------------------------------
+// SECTION 1 — live statistics
 //
-// File layout:
-//   [FileHeader]                  (written once, at the start)
-//   [RecordHeader][payload bytes] (repeated once per Arena buffer)
-//   [RecordHeader][payload bytes]
-//   ...
-// ----------------------------------------------------------------------------
-
-#pragma pack(push, 1)
-
-struct FileHeader
-{
-	char     magic[8];      // "CAROEVT1" - identifies this custom format
-	uint64_t pixelFormat;   // verbatim value from Arena::IImage::GetPixelFormat()
-	uint32_t bitsPerPixel;  // verbatim value from Arena::IImage::GetBitsPerPixel()
-	uint32_t width;         // verbatim value from Arena::IImage::GetWidth()
-	uint32_t height;        // verbatim value from Arena::IImage::GetHeight()
-	uint64_t reserved;      // zero-filled, reserved for future use
+// Updated from the SDK's decoding thread inside the CD callback, read from
+// the main thread. relaxed ordering is correct here: these are monotonic
+// counters used for human-readable progress, never for control flow that
+// needs to observe a consistent snapshot across all four values.
+// ---------------------------------------------------------------------------
+struct Stats {
+	std::atomic<uint64_t> totalEvents{0};
+	std::atomic<uint64_t> positiveEvents{0};
+	std::atomic<uint64_t> negativeEvents{0};
+	std::atomic<int64_t>  lastEventTimestampUs{0}; // sensor clock, microseconds
 };
 
-struct RecordHeader
-{
-	uint64_t frameId;       // Arena::IBuffer::GetFrameId()
-	uint64_t timestampNs;   // Arena::IImage::GetTimestampNs() (buffer-level, NOT per-event)
-	uint64_t payloadSize;   // Arena::IBuffer::GetSizeFilled(); payload bytes follow immediately
+static Stats g_stats;
+
+// ---------------------------------------------------------------------------
+// SECTION 2 — CLI
+// ---------------------------------------------------------------------------
+struct Args {
+	std::string outputPath;
+	std::string biasFileIn;    // --bias-file  : load before start
+	std::string biasFileOut;   // --save-bias  : dump effective biases to file
+	std::string serial;        // --serial     : pick a specific camera
+	double      durationSec   = 0.0;   // 0 = until Ctrl-C
+	double      statsInterval = 2.0;
+	uint32_t    ercRate       = 0;     // events/sec; 0 = leave untouched
+	bool        ercOff        = false;
+	bool        infoOnly      = false;
+	bool        showHelp      = false;
 };
 
-#pragma pack(pop)
-
-static_assert(sizeof(FileHeader) == 36, "FileHeader size changed - packing assumption broke");
-static_assert(sizeof(RecordHeader) == 24, "RecordHeader size changed - packing assumption broke");
-
-// ============================================================================
-// SECTION 2 — Lock-free single-producer/single-consumer ring buffer
-// ============================================================================
-// Thread A (acquisition) is the ONLY producer. Thread B (disk writer) is the
-// ONLY consumer. This is the classic SPSC ring buffer: each side only ever
-// writes its own atomic index and only ever reads the other side's atomic
-// index, so no compare-and-swap and no mutex are needed on the data path.
-//
-// Slots are pre-allocated once at startup (sized from the stream's
-// 'PayloadSize' node, see main()) so the hot path never allocates memory.
-// If the queue is full, TryPush() returns false immediately (never blocks);
-// the caller is responsible for counting this as a drop and moving on.
-// ----------------------------------------------------------------------------
-
-class SpscByteRing
+static void PrintUsage(const char *argv0)
 {
-public:
-	SpscByteRing(size_t numSlots, size_t slotCapacity)
-		: m_numSlots(numSlots)
-		, m_slotCapacity(slotCapacity)
-		, m_slots(numSlots)
-		, m_validSize(numSlots, 0)
-		, m_recordHeader(numSlots)
-		, m_head(0)
-		, m_tail(0)
-	{
-		if (numSlots < 2)
-			throw std::invalid_argument("SpscByteRing needs at least 2 slots");
-		for (auto& slot : m_slots)
-			slot.resize(slotCapacity);
-	}
+	std::cout <<
+		"Sparse event recorder for LUCID Triton2 EVS via Metavision SDK.\n"
+		"Writes a standard Prophesee .raw file plus a .meta.json sidecar.\n"
+		"\n"
+		"Usage:\n"
+		"  " << argv0 << " --output <path.raw> [options]\n"
+		"  " << argv0 << " --info\n"
+		"\n"
+		"Options:\n"
+		"  --output <path.raw>     Output file. Overwritten if it exists.\n"
+		"  --duration <seconds>    Stop automatically after N seconds.\n"
+		"                          Omit or 0 to record until Ctrl-C.\n"
+		"  --bias-file <path>      Load a bias profile before starting. This is\n"
+		"                          the Metavision replacement for Arena's\n"
+		"                          UserSet1/UserSet2, which allowed only two\n"
+		"                          on-camera slots. Here you can keep one file\n"
+		"                          per lighting condition, unlimited.\n"
+		"  --save-bias <path>      Write the biases actually in effect to a file\n"
+		"                          (after --bias-file is applied, if given).\n"
+		"                          Use this to snapshot a tuned configuration.\n"
+		"  --erc-rate <ev/s>       Enable Event Rate Control at this target, in\n"
+		"                          EVENTS PER SECOND (not Mev/s). LUCID recommends\n"
+		"                          40 Mev/s on a 1GigE link -> --erc-rate 40000000.\n"
+		"                          Note ERC DROPS events to stay under the target:\n"
+		"                          leave it off for noise-floor/calibration work,\n"
+		"                          turn it on to protect a long capture from\n"
+		"                          link overflow.\n"
+		"  --erc-off               Explicitly disable ERC before recording.\n"
+		"  --serial <serial>       Open a specific camera instead of the first\n"
+		"                          available one.\n"
+		"  --stats-interval <sec>  Live stats print period (default 2.0, 0=off).\n"
+		"  --info                  Print camera info, geometry, biases, ERC state,\n"
+		"                          then exit without recording.\n"
+		"  --help                  This message.\n"
+		"\n"
+		"Before running: close ArenaView / evs_recorder / anything Arena-based.\n"
+		"Only one process can hold the GigE Vision control channel at a time.\n"
+		"\n"
+		"Environment (set these or the camera will not be found):\n"
+		"  MV_HAL_PLUGIN_PATH  must include LUCID's hal_plugin directory\n"
+		"  LD_LIBRARY_PATH     must include ArenaSDK_Linux_x64/Metavision/lib\n";
+}
 
-	size_t Capacity() const { return m_numSlots; }
-	size_t SlotBytes() const { return m_slotCapacity; }
-
-	// Producer-only. Never blocks. Returns false if the ring is full.
-	bool TryPush(const uint8_t* data, size_t size, const RecordHeader& hdr)
-	{
-		const size_t head = m_head.load(std::memory_order_relaxed);
-		const size_t nextHead = (head + 1) % m_numSlots;
-		const size_t tail = m_tail.load(std::memory_order_acquire);
-
-		if (nextHead == tail)
-			return false; // full
-
-		size_t copySize = size;
-		bool truncated = false;
-		if (copySize > m_slotCapacity)
-		{
-			copySize = m_slotCapacity;
-			truncated = true;
+// Parses "--flag value" pairs. Returns false with a message on malformed input
+// rather than silently continuing with a default, because a recorder that
+// silently ignores "--duration 600" and then stops at Ctrl-C is worse than one
+// that refuses to start.
+static bool ParseArgs(int argc, char **argv, Args &out, std::string &error)
+{
+	auto needValue = [&](int &i, const char *flag, std::string &dst) -> bool {
+		if (i + 1 >= argc) {
+			error = std::string(flag) + " requires a value";
+			return false;
 		}
-
-		std::memcpy(m_slots[head].data(), data, copySize);
-		m_validSize[head] = copySize;
-		m_recordHeader[head] = hdr;
-		m_recordHeader[head].payloadSize = copySize; // reflect actual bytes stored
-
-		m_head.store(nextHead, std::memory_order_release);
-
-		if (truncated)
-			m_truncationCount.fetch_add(1, std::memory_order_relaxed);
-
+		dst = argv[++i];
 		return true;
-	}
-
-	// Consumer-only. Returns false if the ring is empty.
-	bool TryPop(std::vector<uint8_t>& outBuf, size_t& outSize, RecordHeader& outHdr)
-	{
-		const size_t tail = m_tail.load(std::memory_order_relaxed);
-		const size_t head = m_head.load(std::memory_order_acquire);
-
-		if (tail == head)
-			return false; // empty
-
-		outSize = m_validSize[tail];
-		outHdr = m_recordHeader[tail];
-		if (outBuf.size() < outSize)
-			outBuf.resize(outSize);
-		std::memcpy(outBuf.data(), m_slots[tail].data(), outSize);
-
-		const size_t nextTail = (tail + 1) % m_numSlots;
-		m_tail.store(nextTail, std::memory_order_release);
-		return true;
-	}
-
-	bool Empty() const
-	{
-		return m_tail.load(std::memory_order_acquire) == m_head.load(std::memory_order_acquire);
-	}
-
-	uint64_t TruncationCount() const { return m_truncationCount.load(std::memory_order_relaxed); }
-
-private:
-	size_t m_numSlots;
-	size_t m_slotCapacity;
-	std::vector<std::vector<uint8_t>> m_slots;
-	std::vector<size_t> m_validSize;
-	std::vector<RecordHeader> m_recordHeader;
-	std::atomic<size_t> m_head;
-	std::atomic<size_t> m_tail;
-	std::atomic<uint64_t> m_truncationCount{ 0 };
-};
-
-// ============================================================================
-// SECTION 3 — Live statistics counters
-// ============================================================================
-
-struct Stats
-{
-	std::atomic<uint64_t> buffersAcquired{ 0 };
-	std::atomic<uint64_t> buffersRequeued{ 0 };
-	std::atomic<uint64_t> incompleteBuffers{ 0 };
-	std::atomic<uint64_t> queueOverflowDrops{ 0 };
-	std::atomic<uint64_t> bytesWritten{ 0 };
-	std::atomic<uint64_t> recordsWritten{ 0 };
-	std::atomic<uint64_t> reconnectEvents{ 0 };
-};
-
-Stats g_stats;
-
-// ============================================================================
-// SECTION 4 — Disconnect callback (Arena::IDisconnectCallback)
-// ============================================================================
-// Confirmed API: Arena/IDisconnectCallback.h declares
-//   virtual void OnDeviceDisconnected(Arena::IDevice* pDisconnectedDevice) = 0;
-// Registered via Arena::ISystem::RegisterDeviceDisconnectCallback (ISystem.h).
-// This does not itself recover the connection - it only logs. Recovery is
-// handled in the acquisition thread's exception handling (Section 6), using
-// the confirmed Arena::IDevice::WaitForReconnection(uint64_t timeout) API.
-// ----------------------------------------------------------------------------
-
-class RecorderDisconnectCallback : public Arena::IDisconnectCallback
-{
-public:
-	void OnDeviceDisconnected(Arena::IDevice* /*pDisconnectedDevice*/) override
-	{
-		std::cerr << "[warning] Device disconnected unexpectedly (network/PoE hiccup?). "
-			<< "Acquisition thread will attempt to wait for reconnection." << std::endl;
-	}
-};
-
-// ============================================================================
-// SECTION 5 — GenApi node helpers
-// ============================================================================
-// NOTE ON PROVENANCE: the GenApi::CEnumerationPtr / CEnumEntryPtr / CIntegerPtr
-// usage pattern below is copied and adapted directly from the example code
-// embedded in Arena/IDevice.h's own Doxygen comments (see Phase 2 of the
-// report for the exact quoted block). The GenApi/GenICam headers themselves
-// were NOT part of the provided Include.zip, so the precise class names
-// could not be independently verified against that zip - if your build
-// reports these types as undeclared, add:
-//     #include <GenApi/GenApi.h>
-// from your ArenaSDK's GenICam/library/... directory.
-// ----------------------------------------------------------------------------
-
-// EMPIRICAL FINDING (from --dump-nodes against the real TRT009S-E): this
-// camera does NOT expose a standard SFNC "PixelFormat" node at all. The real
-// feature controlling event output is "EventFormat", a generic enumeration
-// with exactly two entries matching the actual Prophesee protocol names:
-//   EVT2_1   (EnumEntry_EventFormat_EVT2_1)
-//   EVT3_0   (EnumEntry_EventFormat_EVT3_0)
-// A second, related node "EventFormatSize" selects a bit-width variant:
-//   Bpe16    (EnumEntry_EventFormatSize_Bpe16)
-//   Bpe64    (EnumEntry_EventFormatSize_Bpe64)
-// ("Bpe" = bits/bytes per event - exact meaning not confirmed from headers;
-// discovered empirically, not guessed). Everything below targets these two
-// real nodes instead of the nonexistent "PixelFormat".
-void ListEventFormats(GenApi::INodeMap* pNodeMap)
-{
-	auto printEnum = [&](const char* nodeName)
-	{
-		GenApi::CEnumerationPtr pEnum = pNodeMap->GetNode(nodeName);
-		if (!pEnum.IsValid())
-		{
-			std::cout << nodeName << ": node not found on this device." << std::endl;
-			return;
-		}
-		GenApi::StringList_t symbolics;
-		pEnum->GetSymbolics(symbolics);
-		std::cout << nodeName << " entries:\n";
-		for (auto& s : symbolics)
-			std::cout << "  " << s.c_str() << "\n";
 	};
 
-	printEnum("EventFormat");
-	printEnum("EventFormatSize");
+	for (int i = 1; i < argc; ++i) {
+		const std::string a = argv[i];
+		std::string v;
 
-	std::cout << "\nPass a value with --event-format <NAME> (and optionally\n"
-		<< "--event-format-size <NAME>) to record. EVT3_0 is the modern,\n"
-		<< "denser Prophesee protocol and is the recommended starting point.\n"
-		<< std::endl;
-}
-
-// Diagnostic: dump every node name on the device (unchanged from before -
-// kept because it is how EventFormat/EventFormatSize were found in the
-// first place, and remains useful if yet another node needs discovering).
-void DumpAllNodes(GenApi::INodeMap* pNodeMap, const std::string& filterSubstring)
-{
-	GenApi::NodeList_t nodes;
-	pNodeMap->GetNodes(nodes);
-
-	std::cout << "Total nodes on device node map: " << nodes.size() << "\n";
-	if (!filterSubstring.empty())
-		std::cout << "Filtering to names containing (case-sensitive): \"" << filterSubstring << "\"\n";
-	std::cout << "----\n";
-
-	size_t printedCount = 0;
-	for (auto* pNode : nodes)
-	{
-		if (pNode == nullptr)
-			continue;
-
-		const std::string name = pNode->GetName().c_str();
-		if (!filterSubstring.empty() && name.find(filterSubstring) == std::string::npos)
-			continue;
-
-		std::cout << name << "  [interfaceType=" << pNode->GetPrincipalInterfaceType() << "]\n";
-		++printedCount;
-	}
-
-	std::cout << "----\n" << printedCount << " node(s) printed." << std::endl;
-}
-
-// Sets an enumeration node by symbolic name if the node exists; if optional
-// and absent, does nothing (silently) rather than throwing.
-//
-// IMPORTANT — EventFormatSize is NOT independently writable on this camera:
-// a real run hit "[fatal] GenICam exception: Node is not writable." on the
-// SetIntValue() call for EventFormatSize, immediately after EventFormat was
-// set and confirmed successfully. This matches an earlier observation: after
-// setting ONLY EventFormat=EVT3_0 (EventFormatSize never touched), --get-enum
-// EventFormatSize already reported Bpe16. Put together, the simplest
-// explanation is that EventFormatSize is a READ-ONLY reflection driven by
-// whichever EventFormat entry is selected (EVT3_0 -> Bpe16 on this firmware),
-// not an independently settable node — the earlier "stale leftover value"
-// theory (see Stage 1.1 history below) was the wrong explanation for the
-// same symptom. So: try to WRITE only if the node reports writable right
-// now; if it doesn't, fall back to READ-and-verify — if the camera already
-// reports the requested value we're done (that's the expected, healthy case
-// for EventFormatSize), and only throw if it reports something ELSE (a
-// genuine mismatch we can't fix by writing).
-void ApplyEnumIfPresent(GenApi::INodeMap* pNodeMap, const char* nodeName,
-                        const std::string& value, bool required)
-{
-	GenApi::CEnumerationPtr pEnum = pNodeMap->GetNode(nodeName);
-	if (!pEnum.IsValid())
-	{
-		if (required)
-			throw std::runtime_error(std::string(nodeName) + " node not found on device node map.");
-		return;
-	}
-
-	GenApi::CEnumEntryPtr pEntry = pEnum->GetEntryByName(value.c_str());
-	if (!pEntry.IsValid())
-	{
-		throw std::runtime_error(
-			std::string(nodeName) + " entry '" + value + "' not found. Run --list-event-formats "
-			"first to see the exact symbolic names this camera's firmware exposes.");
-	}
-
-	if (!GenApi::IsWritable(pEnum))
-	{
-		// Not writable right now — could be permanently read-only (driven by
-		// another node, e.g. EventFormatSize following EventFormat), or
-		// temporarily locked by device state. Either way, don't guess:
-		// verify what the camera actually reports and decide from that.
-		int64_t currentVal = pEnum->GetIntValue();
-		if (currentVal == pEntry->GetValue())
-		{
-			std::cout << nodeName << " = " << value << " (already set — node is read-only "
-				<< "on this camera right now, but the current value already matches what "
-				<< "was requested, so this is fine)" << std::endl;
-			return;
-		}
-		throw std::runtime_error(
-			std::string(nodeName) + " is not writable right now, and its current value does "
-			"NOT match the requested '" + value + "' (raw int " +
-			std::to_string(currentVal) + " vs expected " + std::to_string(pEntry->GetValue()) +
-			"). If this is EventFormatSize, it may be entirely driven by the current "
-			"EventFormat selection rather than independently settable on this firmware — "
-			"try a different --event-format-size value that matches what this EventFormat "
-			"actually produces (check via --get-enum " + std::string(nodeName) +
-			" right after setting --event-format alone), or drop --event-format-size "
-			"and rely on the read-back verification instead of a hard requirement.");
-	}
-
-	pEnum->SetIntValue(pEntry->GetValue());
-
-	// Confirm the camera actually accepted the value instead of trusting
-	// SetIntValue() blindly — a stale/leftover value from a previous session
-	// (see the Bpe16-leftover incident: EventFormatSize silently kept its
-	// old value from a prior run when this node wasn't touched) can look
-	// identical to a successful set unless we read it back.
-	int64_t confirmVal = pEnum->GetIntValue();
-	if (confirmVal != pEntry->GetValue())
-	{
-		throw std::runtime_error(
-			std::string(nodeName) + ": set to '" + value + "' failed — camera still reports "
-			"raw int value " + std::to_string(confirmVal) + " (expected " +
-			std::to_string(pEntry->GetValue()) + "). Refusing to continue with an ambiguous "
-			"node state.");
-	}
-	std::cout << "Set " << nodeName << " = " << value << " (confirmed)" << std::endl;
-}
-
-// Prints the CURRENT symbolic value of an enum node — deliberately does NOT
-// assume an unverified "GetCurrentEntry()" method exists. Instead it uses
-// only already-confirmed APIs: read the current raw int (GetIntValue,
-// confirmed in GenApi/IEnumeration.h), then walk every symbolic name
-// (GetSymbolics, confirmed) and match by looking up each one's int value
-// (GetEntryByName + IEnumEntry::GetValue, both confirmed) until one matches.
-void PrintEnumCurrentValue(GenApi::INodeMap* pNodeMap, const char* nodeName)
-{
-	GenApi::CEnumerationPtr pEnum = pNodeMap->GetNode(nodeName);
-	if (!pEnum.IsValid())
-	{
-		std::cout << nodeName << ": node not found on this device." << std::endl;
-		return;
-	}
-
-	int64_t currentInt = pEnum->GetIntValue();
-	GenApi::StringList_t symbolics;
-	pEnum->GetSymbolics(symbolics);
-
-	for (auto& s : symbolics)
-	{
-		GenApi::CEnumEntryPtr pEntry = pEnum->GetEntryByName(s);
-		if (pEntry.IsValid() && pEntry->GetValue() == currentInt)
-		{
-			std::cout << nodeName << " = " << s.c_str() << "  (raw int value " << currentInt << ")"
-				<< std::endl;
-			return;
-		}
-	}
-	std::cout << nodeName << " = <unknown symbolic>  (raw int value " << currentInt << ")" << std::endl;
-}
-
-// Prints what payload/interface type the first captured buffer actually is.
-// We no longer assume BufferPayloadTypeImage + HasImageData() - this prints
-// the ground truth so the rest of the pipeline can be adjusted if needed.
-void DiagnoseFirstBuffer(Arena::IBuffer* pBuffer)
-{
-	std::cout << "First buffer diagnostic: "
-		<< "payloadType=" << pBuffer->GetPayloadType()
-		<< " hasImageData=" << pBuffer->HasImageData()
-		<< " hasChunkData=" << pBuffer->HasChunkData()
-		<< " sizeFilled=" << pBuffer->GetSizeFilled()
-		<< " frameId=" << pBuffer->GetFrameId()
-		<< std::endl;
-}
-
-// Explicitly select 'OldestFirst' (not the device default 'OldestFirstOverwrite')
-// so that a full output queue produces an honest, countable drop
-// ('StreamLostFrameCount') instead of silently overwriting unread data.
-// Node name and the three enum values are confirmed verbatim from the
-
-// Doxygen example embedded in Arena/IDevice.h (StartStream docblock).
-void SetStreamBufferHandlingModeOldestFirst(GenApi::INodeMap* pTLStreamNodeMap)
-{
-	GenApi::CEnumerationPtr pMode = pTLStreamNodeMap->GetNode("StreamBufferHandlingMode");
-	if (!pMode.IsValid())
-	{
-		std::cerr << "[warning] 'StreamBufferHandlingMode' node not found; "
-			<< "proceeding with device default." << std::endl;
-		return;
-	}
-	GenApi::CEnumEntryPtr pEntry = pMode->GetEntryByName("OldestFirst");
-	if (!pEntry.IsValid())
-	{
-		std::cerr << "[warning] 'OldestFirst' entry not found on 'StreamBufferHandlingMode'; "
-			<< "proceeding with device default." << std::endl;
-		return;
-	}
-	pMode->SetIntValue(pEntry->GetValue());
-}
-
-// 'PayloadSize' node name confirmed verbatim from Arena/IBuffer.h's
-// IsIncomplete() docblock. Used only to size our own ring buffer slots -
-// never assumed to be the exact size of every buffer (event cameras produce
-// variable-size payloads depending on how many events occurred).
-uint64_t GetStreamPayloadSize(GenApi::INodeMap* pTLStreamNodeMap)
-{
-	try
-	{
-		GenApi::CIntegerPtr pNode = pTLStreamNodeMap->GetNode("PayloadSize");
-		if (pNode.IsValid())
-			return static_cast<uint64_t>(pNode->GetValue());
-	}
-	catch (...)
-	{
-		// Node absent or unreadable on this GenTL producer version; fall back below.
-	}
-	return 0;
-}
-
-// 'StreamMissedPacketCount' and 'StreamLostFrameCount' node names confirmed
-// verbatim from Arena/IBuffer.h and Arena/IDevice.h docblocks respectively.
-uint64_t ReadStreamIntegerNode(GenApi::INodeMap* pTLStreamNodeMap, const char* nodeName)
-{
-	try
-	{
-		GenApi::CIntegerPtr pNode = pTLStreamNodeMap->GetNode(nodeName);
-		if (pNode.IsValid())
-			return static_cast<uint64_t>(pNode->GetValue());
-	}
-	catch (...)
-	{
-		// Node absent on this GenTL producer version; treat as unavailable (0).
-	}
-	return 0;
-}
-
-// Sets a boolean node to `value` IF it exists and is writable; otherwise
-// prints a one-line status and does nothing. Never throws, never crashes.
-//
-// PROVENANCE NOTE: unlike every other node name used elsewhere in this file
-// (EventFormat, Width, Height, StreamBufferHandlingMode, PayloadSize,
-// StreamMissedPacketCount, StreamLostFrameCount - all confirmed either by
-// --dump-nodes against the real camera or by a quoted Arena SDK header
-// docblock), "StreamPacketResendEnable" and "StreamAutoNegotiatePacketSize"
-// have NOT been confirmed against this camera's TL Stream node map or any
-// Arena header. They are common GenTL-standard names on many GigE Vision
-// cameras, but that is not proof they exist HERE. Run this to check first:
-//     ./evs_recorder --dump-nodes --target stream --filter Packet
-// If the names differ, this function will simply print "not found" and skip
-// - it will not crash or silently do the wrong thing either way.
-bool TryEnableBoolean(GenApi::INodeMap* pNodeMap, const char* nodeName, bool value)
-{
-	try
-	{
-		GenApi::CBooleanPtr pNode = pNodeMap->GetNode(nodeName);
-		if (!pNode.IsValid())
-		{
-			std::cerr << "[net-tuning] '" << nodeName << "' not found on this node map "
-				<< "- skipped (not fatal). Run --dump-nodes --target stream --filter "
-				<< "Packet to find the real name if one exists." << std::endl;
-			return false;
-		}
-		if (!GenApi::IsWritable(pNode))
-		{
-			std::cerr << "[net-tuning] '" << nodeName << "' exists but is not writable "
-				<< "right now - skipped." << std::endl;
-			return false;
-		}
-		pNode->SetValue(value);
-		std::cout << "[net-tuning] " << nodeName << " = " << (value ? "true" : "false")
-			<< std::endl;
-		return true;
-	}
-	catch (GenICam::GenericException& e)
-	{
-		std::cerr << "[net-tuning] '" << nodeName << "': " << e.GetDescription()
-			<< " - skipped (not fatal)." << std::endl;
-		return false;
-	}
-}
-
-// XYPT was chased across two rounds of debugging and is now DEAD for this
-// camera/firmware — confirmed empirically: the node this program tried
-// ("EvsOutputFormat") does not exist on the TRT009S-E's node map (see
-// --dump-nodes --filter Output / Frame / Mode / XY output, all negative),
-// and there is no other candidate node exposing an XYPT-like enum on this
-// firmware. TryApplyOutputFormat(), --output-format-node/value,
-// --legacy-cdframe, --strict-xypt and --flat-xypt have all been removed —
-// this program now ALWAYS uses the camera's one confirmed real decode path
-// (EventFormat=EVT3_0, EventFormatSize=Bpe16/Bpe64), and per-event real
-// microsecond timestamps are recovered entirely offline in
-// cevt_to_events.py by decoding the EVT3.0 TIME_LOW/TIME_HIGH words inside
-// the payload — never from a camera-side XYPT struct that does not exist.
-
-// --erc-rate-limit <Mev/s>: ErcRateLimit is a FLOAT node (interfaceType=5,
-// confirmed via --dump-nodes against the real TRT009S-E on 2026-07-xx) -
-// NOT an Integer like ErcReferencePeriod (interfaceType=2). Using the wrong
-// GenApi pointer type (CIntegerPtr) here would silently fail IsValid() and
-// do nothing - CFloatPtr is required. Confirmed real API: GenApi::CFloatPtr,
-// IFloat::SetValue(double, bool=true) / GetValue(bool=false, bool=false)
-// (GenApi/Pointer.h, GenApi/IFloat.h).
-bool TrySetFloat(GenApi::INodeMap* pNodeMap, const char* nodeName, double value)
-{
-	try
-	{
-		GenApi::CFloatPtr pNode = pNodeMap->GetNode(nodeName);
-		if (!pNode.IsValid())
-		{
-			std::cerr << "[erc] '" << nodeName << "' not found or not a Float node - skipped."
-				<< std::endl;
-			return false;
-		}
-		if (!GenApi::IsWritable(pNode))
-		{
-			std::cerr << "[erc] '" << nodeName << "' exists but is not writable right now - "
-				<< "skipped." << std::endl;
-			return false;
-		}
-		pNode->SetValue(value);
-		std::cout << "[erc] " << nodeName << " = " << value << std::endl;
-		return true;
-	}
-	catch (GenICam::GenericException& e)
-	{
-		std::cerr << "[erc] '" << nodeName << "': " << e.GetDescription()
-			<< " - skipped (not fatal)." << std::endl;
-		return false;
-	}
-}
-
-double ReadFloatNode(GenApi::INodeMap* pNodeMap, const char* nodeName)
-{
-	try
-	{
-		GenApi::CFloatPtr pNode = pNodeMap->GetNode(nodeName);
-		if (pNode.IsValid())
-			return pNode->GetValue();
-	}
-	catch (...) {}
-	return -1.0; // sentinel: node absent/unreadable
-}
-
-// --load-features <file.txt>: applies a previously-saved bias/exposure
-// profile to the device's main node map BEFORE StartStream, using Arena's
-// own Arena::FeatureStream::Read() (confirmed real API, Arena/FeatureStream.h).
-// This is what makes "one command = one fully-specified recording session"
-// possible instead of silently inheriting whatever was last written to the
-// camera (e.g. via ArenaView) from an unknown prior session.
-void LoadFeaturesIfRequested(GenApi::INodeMap* pNodeMap, const std::string& path)
-{
-	if (path.empty())
-		return;
-	std::cout << "Loading feature profile: " << path << std::endl;
-	Arena::FeatureStream fs(pNodeMap);
-	fs.Read(path.c_str());   // throws GenICam::GenericException on failure; let caller's
-	                 // top-level catch handle it - do not mask a bad profile load.
-	std::cout << "Feature profile loaded OK." << std::endl;
-}
-
-// ============================================================================
-// SECTION 6 — Thread A: acquisition
-// ============================================================================
-
-void AcquisitionThreadFunc(Arena::IDevice* pDevice, SpscByteRing& ring, std::atomic<bool>& stopFlag)
-{
-	// Short timeout so the loop re-checks stopFlag promptly instead of
-	// blocking for a long time with nothing to do. Confirmed behavior from
-	// Arena/IDevice.h::GetBuffer docblock: "A timeout value of 0 ensures the
-	// call will not block... GenICam::TimeoutException is thrown" when the
-	// timeout elapses with nothing in the output queue.
-	const uint64_t kGetBufferTimeoutMs = 200;
-
-	int consecutiveGenericErrors = 0;
-
-	while (!stopFlag.load(std::memory_order_relaxed))
-	{
-		Arena::IBuffer* pBuffer = nullptr;
-
-		try
-		{
-			pBuffer = pDevice->GetBuffer(kGetBufferTimeoutMs);
-		}
-		catch (GenICam::TimeoutException&)
-		{
-			// No data arrived within this window - not an error, just idle.
-			continue;
-		}
-		catch (GenICam::GenericException& e)
-		{
-			std::cerr << "[acquisition] GenICam exception: " << e.GetDescription() << std::endl;
-			++consecutiveGenericErrors;
-
-			if (!pDevice->IsConnected())
-			{
-				std::cerr << "[acquisition] Device appears disconnected; "
-					<< "waiting for reconnection..." << std::endl;
-
-				const int kMaxReconnectAttempts = 6;   // ~30s total at 5s each
-				bool reconnected = false;
-				for (int attempt = 0;
-					attempt < kMaxReconnectAttempts && !stopFlag.load(std::memory_order_relaxed);
-					++attempt)
-				{
-					if (pDevice->WaitForReconnection(5000))
-					{
-						reconnected = true;
-						break;
-					}
-				}
-
-				if (reconnected)
-				{
-					std::cerr << "[acquisition] Device reconnected; resuming acquisition."
-						<< std::endl;
-					g_stats.reconnectEvents.fetch_add(1, std::memory_order_relaxed);
-					consecutiveGenericErrors = 0;
-				}
-				else
-				{
-					std::cerr << "[acquisition] Device did not reconnect after "
-						<< (kMaxReconnectAttempts * 5) << " seconds; stopping recording."
-						<< std::endl;
-					stopFlag.store(true, std::memory_order_relaxed);
-					break;
-				}
-			}
-			else if (consecutiveGenericErrors > 50)
-			{
-				std::cerr << "[acquisition] Too many consecutive errors while still "
-					<< "reporting connected; stopping recording." << std::endl;
-				stopFlag.store(true, std::memory_order_relaxed);
-				break;
-			}
-			continue;
-		}
-
-		consecutiveGenericErrors = 0;
-		g_stats.buffersAcquired.fetch_add(1, std::memory_order_relaxed);
-
-		// Confirmed from Arena/IBuffer.h::IsIncomplete docblock: signals that
-		// GetSizeFilled() does not match the expected 'PayloadSize', usually
-		// due to missed packets. We still must requeue it (Arena owns the
-		// memory regardless of completeness).
-		if (pBuffer->IsIncomplete())
-		{
-			g_stats.incompleteBuffers.fetch_add(1, std::memory_order_relaxed);
-			pDevice->RequeueBuffer(pBuffer);
-			g_stats.buffersRequeued.fetch_add(1, std::memory_order_relaxed);
-			continue;
-		}
-
-		RecordHeader hdr{};
-		hdr.frameId = pBuffer->GetFrameId();
-		hdr.payloadSize = static_cast<uint64_t>(pBuffer->GetSizeFilled());
-
-		// Step 0 diagnostic (per debugging guide): print payloadType/HasImageData
-		// for every buffer, not just the first, to confirm empirically whether
-		// EVT3.0 payload buffers ever expose buffer-level image timestamps on
-		// this camera/SDK/firmware combination. Capped to avoid flooding stdout
-		// on long recordings — gate with --debug-buffers [N] (default 20 lines).
-		if (g_debugBufferCount > 0)
-		{
-			std::cerr << "[debug] frameId=" << hdr.frameId
-				<< " payloadType=" << pBuffer->GetPayloadType()
-				<< " HasImageData=" << pBuffer->HasImageData()
-				<< " hasChunkData=" << pBuffer->HasChunkData()
-				<< " sizeFilled=" << hdr.payloadSize
-				<< std::endl;
-			--g_debugBufferCount;
-		}
-
-		// Branch B (confirmed via the Step-0 diagnostic above, and via grep
-		// against Arena/IBuffer.h: GetTimestampNs()/GetTimestamp() exist only on
-		// IImage and ICompressedImage, NOT on IBuffer itself): for this camera's
-		// EVT3.0 payload type, HasImageData() is false, so no buffer-level
-		// image timestamp is ever available here. hdr.timestampNs is therefore
-		// NOT a meaningful per-event (or even per-buffer) time source for this
-		// payload type — it is retained only as a monotonic ordering/gap-
-		// detection aid via hdr.frameId. The real per-event microsecond
-		// timestamp lives INSIDE the payload (EVT3.0 TIME_LOW/TIME_HIGH words),
-		// decoded offline in cevt_to_events.py — never reconstruct t from this
-		// field.
-		hdr.timestampNs = 0;
-
-		if (pBuffer->HasImageData())
-		{
-			Arena::IImage* pImage = pBuffer->AsImage();
-			hdr.timestampNs = pImage->GetTimestampNs();
-		}
-
-		const uint8_t* pData = pBuffer->GetData();
-		if (hdr.payloadSize > ring.SlotBytes())
-		{
-			// Live warning, not just a silent counter — this is exactly the
-			// class of bug that previously corrupted an entire recording
-			// without any visible sign until the file was inspected offline.
-			static std::atomic<int> warnedCount{0};
-			if (warnedCount.fetch_add(1, std::memory_order_relaxed) < 5)
-			{
-				std::cerr << "[WARNING] buffer " << hdr.frameId << " is " << hdr.payloadSize
-					<< " bytes, larger than the ring slot capacity (" << ring.SlotBytes()
-					<< " bytes) - IT WILL BE TRUNCATED. Restart with a larger --queue-slots "
-					<< "or investigate why buffer size grew mid-recording." << std::endl;
-			}
-		}
-		const bool pushed = ring.TryPush(pData, static_cast<size_t>(hdr.payloadSize), hdr);
-		if (!pushed)
-			g_stats.queueOverflowDrops.fetch_add(1, std::memory_order_relaxed);
-
-		// ALWAYS requeue immediately, whether or not the push succeeded.
-		// Per Arena/IDevice.h::RequeueBuffer docblock: holding buffers risks
-		// starving the acquisition engine. This is the single most important
-		// rule for a never-block, never-crash recorder.
-		pDevice->RequeueBuffer(pBuffer);
-		g_stats.buffersRequeued.fetch_add(1, std::memory_order_relaxed);
-	}
-}
-
-// ============================================================================
-// SECTION 7 — Thread B: disk writer
-// ============================================================================
-
-void WriterThreadFunc(SpscByteRing& ring, std::ofstream& outFile, std::atomic<bool>& stopFlag)
-{
-	std::vector<uint8_t> buf;
-	size_t size = 0;
-	RecordHeader hdr{};
-
-	while (true)
-	{
-		const bool got = ring.TryPop(buf, size, hdr);
-		if (got)
-		{
-			outFile.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-			outFile.write(reinterpret_cast<const char*>(buf.data()),
-				static_cast<std::streamsize>(size));
-			g_stats.bytesWritten.fetch_add(sizeof(hdr) + size, std::memory_order_relaxed);
-			g_stats.recordsWritten.fetch_add(1, std::memory_order_relaxed);
-		}
-		else
-		{
-			if (stopFlag.load(std::memory_order_relaxed) && ring.Empty())
-				break; // fully drained after stop was requested - safe to exit
-
-			// Brief idle backoff. This sleep only ever happens on the
-			// CONSUMER side when there is nothing to do; it never affects
-			// the producer's non-blocking guarantee.
-			std::this_thread::sleep_for(std::chrono::microseconds(200));
-		}
-	}
-
-	outFile.flush();
-}
-
-// ============================================================================
-// SECTION 8 — Device discovery helper
-// ============================================================================
-
-Arena::DeviceInfo FindDevice(Arena::ISystem* pSystem, const std::string& serialFilter)
-{
-	pSystem->UpdateDevices(2000); // 2s discovery window
-	std::vector<Arena::DeviceInfo> devices = pSystem->GetDevices();
-
-	if (devices.empty())
-	{
-		throw std::runtime_error(
-			"No GigE Vision devices discovered. Check PoE link power, IP configuration, "
-			"and make sure no other application (e.g. ArenaView) is holding the device open.");
-	}
-
-	if (!serialFilter.empty())
-	{
-		for (auto& info : devices)
-		{
-			if (std::string(info.SerialNumber().c_str()) == serialFilter)
-				return info;
-		}
-		throw std::runtime_error("No device found matching --serial " + serialFilter);
-	}
-
-	if (devices.size() > 1)
-	{
-		std::ostringstream oss;
-		oss << "Multiple devices found; pass --serial <SN> to disambiguate:\n";
-		for (auto& info : devices)
-		{
-			oss << "  model=" << info.ModelName().c_str()
-				<< " serial=" << info.SerialNumber().c_str()
-				<< " ip=" << info.IpAddressStr().c_str() << "\n";
-		}
-		throw std::runtime_error(oss.str());
-	}
-
-	return devices[0];
-}
-
-// ============================================================================
-// SECTION 9 — CLI argument parsing
-// ============================================================================
-
-struct Args
-{
-	std::string serial;
-	std::string eventFormatName;       // e.g. "EVT3_0" or "EVT2_1"
-	std::string eventFormatSizeName;   // e.g. "Bpe16" or "Bpe64" - REQUIRED for recording
-	std::string outputPath;
-	bool listEventFormats = false;
-	bool dumpNodes = false;
-	std::string dumpNodesFilter;
-	std::string dumpNodesTarget = "device"; // "device" | "stream"
-	std::string loadFeaturesPath; // --load-features <file.txt>
-	double ercRateLimit = -1.0;   // -1 = don't touch; --erc-rate-limit <Mev/s>
-	std::string getIntNodeName; // e.g. "Width" or "Height" — --get-int diagnostic
-	std::string getEnumNodeName; // e.g. "TestPattern" — --get-enum diagnostic
-	std::string nodeInfoName;    // --node-info <Name>: access-mode + tooltip diagnostic
-	std::string setEnumName;     // --set-enum <Name>: direct enum write diagnostic
-	std::string setEnumValue;    // --set-enum-value <Value>: paired with setEnumName
-	uint64_t durationSeconds = 0; // 0 = run until SIGINT
-	size_t numBuffers = 64;
-	size_t queueSlots = 256;
-	uint64_t statsIntervalSeconds = 1;
-	int debugBuffers = 0;  // --debug-buffers [N]: print Step-0 per-buffer diagnostic for N buffers
-};
-
-void PrintUsage(const char* argv0)
-{
-	std::cerr <<
-		"Usage:\n"
-		"  " << argv0 << " --list-event-formats [--serial <SN>]\n"
-		"  " << argv0 << " --dump-nodes [--filter <substring>] [--serial <SN>]\n"
-		"  " << argv0 << " --get-int <NodeName> [--serial <SN>]\n"
-		"  " << argv0 << " --get-enum <NodeName> [--serial <SN>]\n"
-		"  " << argv0 << " --output <path.cevt> --event-format <NAME> [options]\n"
-		"\n"
-		"Required for recording:\n"
-		"  --output <path>          Output file path (custom container, see report)\n"
-		"  --event-format <NAME>    Exact EventFormat symbolic name, e.g. EVT3_0 or\n"
-		"                           EVT2_1 (run --list-event-formats to confirm)\n"
-		"\n"
-		"Required for recording (both — camera keeps a leftover value from the\n"
-		"previous session otherwise, e.g. a stale Bpe16 was seen surviving\n"
-		"across runs when this node wasn't explicitly touched):\n"
-		"  --event-format-size <NAME>  EventFormatSize symbolic name, e.g. Bpe16/Bpe64\n"
-		"\n"
-		"Optional:\n"
-		"  --serial <SN>            Select a specific camera when multiple are present\n"
-		"  --load-features <file>  Apply a saved bias/exposure profile (Arena::FeatureStream)\n"
-		"                           BEFORE recording, so one command = one fully specified\n"
-		"                           session, independent of whatever was last left on the\n"
-		"                           camera (e.g. via ArenaView)\n"
-		"  --debug-buffers [N]      Print a per-buffer Step-0 diagnostic (payloadType,\n"
-		"                           HasImageData, hasChunkData, sizeFilled) for the first\n"
-		"                           N buffers (default 20 if flag given with no value).\n"
-		"                           Use this to (re)confirm whether EVT3.0 payload buffers\n"
-		"                           ever expose a buffer-level image timestamp on this\n"
-		"                           camera/SDK combo — expected result: HasImageData=0\n"
-		"                           always, i.e. hdr.timestampNs is never meaningful for\n"
-		"                           this payload type (see comment in AcquisitionThreadFunc).\n"
-		"  --erc-rate-limit <Mev/s> Set ErcRateLimit (a FLOAT node) before recording. LUCID's\n"
-		"                           own recommendation for a 1GigE link is 40. NOTE: there is\n"
-		"                           NO node on this camera that counts events ERC silently\n"
-		"                           drops - confirmed absent via --dump-nodes --filter Erc.\n"
-		"                           Raising the limit is the only real mitigation.\n"
-		"  --duration <seconds>     Stop automatically after N seconds (default: run\n"
-		"                           until Ctrl+C / SIGINT)\n"
-		"  --num-buffers <N>        Arena internal buffer pool depth (default 64)\n"
-		"  --queue-slots <N>        Lock-free ring buffer depth (default 256)\n"
-		"  --stats-interval <sec>   Seconds between stats printouts (default 1)\n"
-		"  --list-event-formats     Connect, print EventFormat/EventFormatSize entries, exit\n"
-		"  --dump-nodes             Connect, print every node name on the device, exit\n"
-		"  --target device|stream   With --dump-nodes, which node map to dump\n"
-		"                           (default 'device'; 'stream' = TL Stream node map,\n"
-		"                           where PayloadSize/StreamBufferHandlingMode/etc live)\n"
-		"  --filter <substring>     With --dump-nodes, only print names containing this\n"
-		"  --get-int <NodeName>     Connect, print the current integer value of any named\n"
-		"                           node on the main device node map (e.g. Width, Height), exit\n"
-		"  --get-enum <NodeName>    Connect, print the current symbolic value of any named\n"
-		"                           enum node (e.g. TestPattern, AcquisitionMode), exit\n"
-		"  --node-info <NodeName>   Connect, print IsAvailable/IsReadable/IsWritable plus\n"
-		"                           ToolTip/Description for any named node (no value read\n"
-		"                           or written), exit. Use this to find out WHY a node is\n"
-		"                           locked when --get-enum/--set-enum report not-readable/\n"
-		"                           not-writable — the camera's own ToolTip text sometimes\n"
-		"                           names the gating condition in plain English.\n"
-		"  --set-enum <NodeName> --set-enum-value <Value>\n"
-		"                           Connect, set one enum node directly (writable-check +\n"
-		"                           read-back-verify via the same path recording uses),\n"
-		"                           exit. For probing a node without a full recording run.\n"
-		"\n"
-		"Network tuning (best-effort, non-fatal if unavailable - see console output):\n"
-		"  attempts to enable 'StreamPacketResendEnable' and\n"
-		"  'StreamAutoNegotiatePacketSize' on the TL Stream node map before recording.\n"
-		"  NOTE: these two names are NOT yet confirmed to exist on this camera (unlike\n"
-		"  every other node name this program uses) - run\n"
-		"    --dump-nodes --target stream --filter Packet\n"
-		"  to check the real names first if packet loss is a concern.\n";
-}
-
-bool ParseArgs(int argc, char** argv, Args& args, std::string& errorOut)
-{
-	for (int i = 1; i < argc; ++i)
-	{
-		std::string a = argv[i];
-		auto needValue = [&](const char* flag) -> std::string
-		{
-			if (i + 1 >= argc)
-				throw std::runtime_error(std::string(flag) + " requires a value");
-			return argv[++i];
-		};
-
-		try
-		{
-			if (a == "--serial") args.serial = needValue("--serial");
-			else if (a == "--event-format") args.eventFormatName = needValue("--event-format");
-			else if (a == "--event-format-size") args.eventFormatSizeName = needValue("--event-format-size");
-			else if (a == "--output") args.outputPath = needValue("--output");
-			else if (a == "--list-event-formats") args.listEventFormats = true;
-			else if (a == "--dump-nodes") args.dumpNodes = true;
-			else if (a == "--filter") args.dumpNodesFilter = needValue("--filter");
-			else if (a == "--target") args.dumpNodesTarget = needValue("--target");
-			else if (a == "--load-features") args.loadFeaturesPath = needValue("--load-features");
-		else if (a == "--erc-rate-limit") args.ercRateLimit = std::stod(needValue("--erc-rate-limit"));
-		else if (a == "--get-int") args.getIntNodeName = needValue("--get-int");
-		else if (a == "--get-enum") args.getEnumNodeName = needValue("--get-enum");
-		else if (a == "--node-info") args.nodeInfoName = needValue("--node-info");
-		else if (a == "--set-enum") args.setEnumName = needValue("--set-enum");
-		else if (a == "--set-enum-value") args.setEnumValue = needValue("--set-enum-value");
-			else if (a == "--duration") args.durationSeconds = std::stoull(needValue("--duration"));
-			else if (a == "--num-buffers") args.numBuffers = std::stoull(needValue("--num-buffers"));
-			else if (a == "--queue-slots") args.queueSlots = std::stoull(needValue("--queue-slots"));
-			else if (a == "--stats-interval") args.statsIntervalSeconds = std::stoull(needValue("--stats-interval"));
-			else if (a == "--debug-buffers")
-			{
-				// Optional value: if the next token is a bare (non-flag) integer,
-				// consume it; otherwise default to 20 so `--debug-buffers` alone works.
-				if (i + 1 < argc && !std::string(argv[i + 1]).empty() && argv[i + 1][0] != '-')
-					args.debugBuffers = std::stoi(argv[++i]);
-				else
-					args.debugBuffers = 20;
-			}
-			else if (a == "--help" || a == "-h") { errorOut = ""; return false; }
-			else { errorOut = "Unknown argument: " + a; return false; }
-		}
-		catch (std::exception& e)
-		{
-			errorOut = e.what();
+		if (a == "--help" || a == "-h") {
+			out.showHelp = true;
+		} else if (a == "--info") {
+			out.infoOnly = true;
+		} else if (a == "--erc-off") {
+			out.ercOff = true;
+		} else if (a == "--output") {
+			if (!needValue(i, "--output", out.outputPath)) return false;
+		} else if (a == "--bias-file") {
+			if (!needValue(i, "--bias-file", out.biasFileIn)) return false;
+		} else if (a == "--save-bias") {
+			if (!needValue(i, "--save-bias", out.biasFileOut)) return false;
+		} else if (a == "--serial") {
+			if (!needValue(i, "--serial", out.serial)) return false;
+		} else if (a == "--duration") {
+			if (!needValue(i, "--duration", v)) return false;
+			try { out.durationSec = std::stod(v); }
+			catch (...) { error = "--duration expects a number of seconds"; return false; }
+			if (out.durationSec < 0) { error = "--duration cannot be negative"; return false; }
+		} else if (a == "--stats-interval") {
+			if (!needValue(i, "--stats-interval", v)) return false;
+			try { out.statsInterval = std::stod(v); }
+			catch (...) { error = "--stats-interval expects a number of seconds"; return false; }
+			if (out.statsInterval < 0) { error = "--stats-interval cannot be negative"; return false; }
+		} else if (a == "--erc-rate") {
+			if (!needValue(i, "--erc-rate", v)) return false;
+			try { out.ercRate = static_cast<uint32_t>(std::stoul(v)); }
+			catch (...) { error = "--erc-rate expects a positive integer (events/sec)"; return false; }
+			if (out.ercRate == 0) { error = "--erc-rate must be > 0 (use --erc-off to disable ERC)"; return false; }
+		} else {
+			error = "unknown argument: " + a;
 			return false;
 		}
 	}
-
-	if (!args.listEventFormats && !args.dumpNodes && args.getIntNodeName.empty() && args.getEnumNodeName.empty() && args.nodeInfoName.empty() && args.setEnumName.empty())
-	{
-		if (args.outputPath.empty())
-		{
-			errorOut = "--output is required (or use --list-event-formats)";
-			return false;
-		}
-		if (args.eventFormatName.empty())
-		{
-			errorOut = "--event-format is required (run --list-event-formats first)";
-			return false;
-		}
-		if (args.eventFormatSizeName.empty())
-		{
-			// Previously optional — promoted to required after observing that a
-			// leftover EventFormatSize value from a prior session (e.g. a stale
-			// Bpe16) survives on the camera when this node is never explicitly
-			// touched, and --get-enum after a run with the node unset showed
-			// exactly that: a value this recorder never set. Never let the
-			// camera's ambient state silently decide this.
-			errorOut = "--event-format-size is required (Bpe16 or Bpe64 — run "
-				"--list-event-formats first). Do not rely on whatever value the camera "
-				"happens to already have; it may be left over from a previous session.";
-			return false;
-		}
-	}
-
 	return true;
 }
 
-// ============================================================================
-// SECTION 10 — main()
-// ============================================================================
+// ---------------------------------------------------------------------------
+// SECTION 3 — small helpers
+// ---------------------------------------------------------------------------
 
-int main(int argc, char** argv)
+// ISO-8601-ish UTC stamp for the sidecar. Wall clock, used only for humans
+// correlating this recording with an RGB capture or a lab notebook. All
+// EVENT timing lives in the .raw and comes from the sensor clock.
+static std::string UtcTimestampString()
 {
-	std::signal(SIGINT, SignalHandler);
-	std::signal(SIGTERM, SignalHandler);
+	const auto now  = std::chrono::system_clock::now();
+	const auto secs = std::chrono::system_clock::to_time_t(now);
+	std::tm tm{};
+	gmtime_r(&secs, &tm);
+	char buf[32];
+	std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+	return buf;
+}
 
+// Minimal JSON string escaping. Camera serials/plugin names are tame, but a
+// sidecar that silently produces invalid JSON when a field contains a quote
+// or backslash would break every downstream parser at the worst moment.
+static std::string JsonEscape(const std::string &s)
+{
+	std::string out;
+	out.reserve(s.size() + 8);
+	for (const char c : s) {
+		switch (c) {
+			case '"':  out += "\\\""; break;
+			case '\\': out += "\\\\"; break;
+			case '\n': out += "\\n";  break;
+			case '\r': out += "\\r";  break;
+			case '\t': out += "\\t";  break;
+			default:
+				if (static_cast<unsigned char>(c) < 0x20) {
+					char esc[7];
+					std::snprintf(esc, sizeof(esc), "\\u%04x", c);
+					out += esc;
+				} else {
+					out += c;
+				}
+		}
+	}
+	return out;
+}
+
+// Deliberate hard exit. See the "KNOWN SDK TEARDOWN BUG" note in the file
+// header: the bundled Metavision libraries throw boost::lock_error during
+// static destruction after all work is done. Everything this program owns
+// (the .raw via stop_recording, the sidecar via an explicit flush+close) is
+// already durable by the time this is called.
+[[noreturn]] static void ExitNow(int code)
+{
+	std::cout.flush();
+	std::cerr.flush();
+	std::_Exit(code);
+}
+
+// ---------------------------------------------------------------------------
+// SECTION 4 — camera introspection
+//
+// Facilities are optional by contract: Device::get_facility<T>() returns a
+// raw pointer that may be null when a plugin does not implement T. Every
+// access below is null-checked; a missing ERC or geometry facility must
+// degrade to "unknown", never crash a recording.
+// ---------------------------------------------------------------------------
+struct CameraInfo {
+	std::string serial;
+	std::string plugin;
+	std::string integrator;
+	std::string encodingFormat;
+	std::string firmware;
+	std::string systemId;
+	int         width  = 0;
+	int         height = 0;
+	bool        ercAvailable = false;
+	bool        ercEnabled   = false;
+	std::map<std::string, int> biases;
+};
+
+static CameraInfo CollectCameraInfo(Metavision::Camera &cam)
+{
+	CameraInfo info;
+
+	const Metavision::CameraConfiguration &cfg = cam.get_camera_configuration();
+	info.serial         = cfg.serial_number;
+	info.plugin         = cfg.plugin_name;
+	info.integrator     = cfg.integrator;
+	info.encodingFormat = cfg.data_encoding_format;
+	info.firmware       = cfg.firmware_version;
+	info.systemId       = cfg.system_ID;
+
+	Metavision::Device &dev = cam.get_device();
+
+	if (const Metavision::I_Geometry *geo = dev.get_facility<Metavision::I_Geometry>()) {
+		info.width  = geo->get_width();
+		info.height = geo->get_height();
+	}
+
+	if (const Metavision::I_ErcModule *erc = dev.get_facility<Metavision::I_ErcModule>()) {
+		info.ercAvailable = true;
+		info.ercEnabled   = erc->is_enabled();
+	}
+
+	// Biases are read through the driver-level wrapper, which exposes the
+	// underlying HAL facility. Null when a plugin has no low-level bias
+	// control, so this is guarded too.
+	if (const Metavision::I_LL_Biases *lb = cam.biases().get_facility()) {
+		info.biases = lb->get_all_biases();
+	}
+
+	return info;
+}
+
+static void PrintCameraInfo(const CameraInfo &info)
+{
+	std::cout << "[camera] serial          = " << info.serial << "\n"
+	          << "[camera] system ID       = " << info.systemId << "\n"
+	          << "[camera] plugin          = " << info.plugin << "\n"
+	          << "[camera] integrator      = " << info.integrator << "\n"
+	          << "[camera] firmware        = " << info.firmware << "\n"
+	          << "[camera] encoding format = " << info.encodingFormat << "\n";
+
+	if (info.width > 0 && info.height > 0) {
+		std::cout << "[camera] geometry        = " << info.width << "x" << info.height << "\n";
+	} else {
+		std::cout << "[camera] geometry        = unknown (no I_Geometry facility)\n";
+	}
+
+	if (info.ercAvailable) {
+		std::cout << "[camera] ERC             = " << (info.ercEnabled ? "enabled" : "disabled") << "\n";
+	} else {
+		std::cout << "[camera] ERC             = not available on this plugin\n";
+	}
+
+	if (info.biases.empty()) {
+		std::cout << "[camera] biases          = unavailable\n";
+	} else {
+		std::cout << "[camera] biases:\n";
+		for (const auto &kv : info.biases) {
+			std::cout << "           " << std::left << std::setw(28) << kv.first
+			          << " = " << kv.second << "\n";
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SECTION 5 — sidecar metadata
+//
+// Written AFTER the run so it can carry the final counters. Explicitly
+// flushed and closed before the process exits, since ExitNow() skips normal
+// stream destruction.
+// ---------------------------------------------------------------------------
+static bool WriteSidecar(const std::string &rawPath,
+                         const CameraInfo  &info,
+                         const Args        &args,
+                         const std::string &startedUtc,
+                         const std::string &stoppedUtc,
+                         double             wallSeconds,
+                         const std::string &stopReason,
+                         std::string       &errorOut)
+{
+	const std::string path = rawPath + ".meta.json";
+	std::ofstream f(path, std::ios::binary | std::ios::trunc);
+	if (!f) {
+		errorOut = "could not open " + path + " for writing";
+		return false;
+	}
+
+	const uint64_t total = g_stats.totalEvents.load(std::memory_order_relaxed);
+	const uint64_t pos   = g_stats.positiveEvents.load(std::memory_order_relaxed);
+	const uint64_t neg   = g_stats.negativeEvents.load(std::memory_order_relaxed);
+	const int64_t  lastT = g_stats.lastEventTimestampUs.load(std::memory_order_relaxed);
+
+	f << "{\n";
+	f << "  \"raw_file\": \""            << JsonEscape(rawPath)          << "\",\n";
+	f << "  \"recorder\": \"evs_recorder (Metavision SDK / OpenEB 4.6.2)\",\n";
+	f << "  \"camera\": {\n";
+	f << "    \"serial\": \""            << JsonEscape(info.serial)         << "\",\n";
+	f << "    \"system_id\": \""         << JsonEscape(info.systemId)       << "\",\n";
+	f << "    \"plugin\": \""            << JsonEscape(info.plugin)         << "\",\n";
+	f << "    \"integrator\": \""        << JsonEscape(info.integrator)     << "\",\n";
+	f << "    \"firmware\": \""          << JsonEscape(info.firmware)       << "\",\n";
+	f << "    \"encoding_format\": \""   << JsonEscape(info.encodingFormat) << "\",\n";
+	f << "    \"width\": "               << info.width                      << ",\n";
+	f << "    \"height\": "              << info.height                     << "\n";
+	f << "  },\n";
+
+	f << "  \"erc\": {\n";
+	f << "    \"available\": " << (info.ercAvailable ? "true" : "false") << ",\n";
+	f << "    \"enabled\": "   << (info.ercEnabled   ? "true" : "false") << ",\n";
+	if (args.ercRate > 0) {
+		f << "    \"requested_rate_events_per_sec\": " << args.ercRate << "\n";
+	} else {
+		f << "    \"requested_rate_events_per_sec\": null\n";
+	}
+	f << "  },\n";
+
+	f << "  \"biases\": {";
+	bool first = true;
+	for (const auto &kv : info.biases) {
+		f << (first ? "\n" : ",\n") << "    \"" << JsonEscape(kv.first) << "\": " << kv.second;
+		first = false;
+	}
+	f << (first ? "" : "\n") << "  },\n";
+	f << "  \"bias_file_loaded\": "
+	  << (args.biasFileIn.empty() ? "null" : ("\"" + JsonEscape(args.biasFileIn) + "\"")) << ",\n";
+
+	f << "  \"run\": {\n";
+	f << "    \"started_utc\": \""   << startedUtc  << "\",\n";
+	f << "    \"stopped_utc\": \""   << stoppedUtc  << "\",\n";
+	f << "    \"wall_seconds\": "    << std::fixed << std::setprecision(3) << wallSeconds << ",\n";
+	f << "    \"stop_reason\": \""   << JsonEscape(stopReason) << "\"\n";
+	f << "  },\n";
+
+	// These counters come from the stats callback, which sees the DECODED
+	// stream. Treat them as a close approximation of what landed in the .raw,
+	// not as an authoritative count: the SDK's writer and the decoder are
+	// separate consumers. The .raw itself is the source of truth.
+	f << "  \"observed_events\": {\n";
+	f << "    \"total\": "                  << total << ",\n";
+	f << "    \"positive\": "               << pos   << ",\n";
+	f << "    \"negative\": "               << neg   << ",\n";
+	f << "    \"last_sensor_timestamp_us\": " << lastT << ",\n";
+	f << "    \"note\": \"decoder-side counters, approximate; .raw is authoritative\"\n";
+	f << "  }\n";
+	f << "}\n";
+
+	f.flush();
+	if (!f) {
+		errorOut = "write error while producing " + path;
+		return false;
+	}
+	f.close();
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// SECTION 6 — main
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv)
+{
 	Args args;
 	std::string parseError;
-	if (!ParseArgs(argc, argv, args, parseError))
-	{
-		if (!parseError.empty())
-			std::cerr << "Argument error: " << parseError << "\n\n";
+	if (!ParseArgs(argc, argv, args, parseError)) {
+		std::cerr << "[error] " << parseError << "\n\n";
 		PrintUsage(argv[0]);
-		return parseError.empty() ? 0 : 1;
+		return 2;
 	}
 
-	Arena::ISystem* pSystem = nullptr;
-	Arena::IDevice* pDevice = nullptr;
-	std::ofstream outFile;
-	RecorderDisconnectCallback disconnectCb;
-	bool disconnectCbRegistered = false;
-
-	try
-	{
-		pSystem = Arena::OpenSystem();
-		Arena::DeviceInfo info = FindDevice(pSystem, args.serial);
-
-		std::cout << "Opening device: model=" << info.ModelName().c_str()
-			<< " serial=" << info.SerialNumber().c_str()
-			<< " ip=" << info.IpAddressStr().c_str() << std::endl;
-
-		pDevice = pSystem->CreateDevice(info);
-
-		GenApi::INodeMap* pNodeMap = pDevice->GetNodeMap();
-		GenApi::INodeMap* pTLStreamNodeMap = pDevice->GetTLStreamNodeMap();
-
-		// ── Diagnostic early-exit paths ─────────────────────────────
-		// NOTE: RegisterDeviceDisconnectCallback is intentionally NOT called
-		// before these paths. The callback is only useful during long
-		// acquisition (to catch unexpected disconnects mid-recording).
-		// For sub-second diagnostic commands, registering and then forgetting
-		// to deregister before DestroyDevice causes 'terminate called without
-		// an active exception' on Linux (confirmed crash on TRT009S-E).
-		// Fix: register the callback AFTER all early exits, just before
-		// StartStream() — the only place it actually matters.
-
-		if (args.listEventFormats)
-		{
-			ListEventFormats(pNodeMap);
-			pSystem->DestroyDevice(pDevice);
-			Arena::CloseSystem(pSystem);
-			return 0;
-		}
-
-		if (args.dumpNodes)
-		{
-			GenApi::INodeMap* pTargetMap = pNodeMap;
-			if (args.dumpNodesTarget == "stream")
-			{
-				pTargetMap = pTLStreamNodeMap;
-				std::cout << "Dumping TL STREAM node map (not the main device node map)."
-					<< std::endl;
-			}
-			else if (args.dumpNodesTarget != "device")
-			{
-				std::cerr << "[warning] --target must be 'device' or 'stream', got '"
-					<< args.dumpNodesTarget << "' - defaulting to 'device'." << std::endl;
-			}
-			DumpAllNodes(pTargetMap, args.dumpNodesFilter);
-			pSystem->DestroyDevice(pDevice);
-			Arena::CloseSystem(pSystem);
-			return 0;
-		}
-
-		if (!args.getIntNodeName.empty())
-		{
-			uint64_t value = ReadStreamIntegerNode(pNodeMap, args.getIntNodeName.c_str());
-			std::cout << args.getIntNodeName << " = " << value << std::endl;
-			pSystem->DestroyDevice(pDevice);
-			Arena::CloseSystem(pSystem);
-			return 0;
-		}
-
-		if (!args.getEnumNodeName.empty())
-		{
-			PrintEnumCurrentValue(pNodeMap, args.getEnumNodeName.c_str());
-			pSystem->DestroyDevice(pDevice);
-			Arena::CloseSystem(pSystem);
-			return 0;
-		}
-
-		// --node-info <Name>: dump access mode + tooltip/description without
-		// reading or writing a value. Added specifically to investigate nodes
-		// that are present in --dump-nodes but return errors on --get-enum/
-		// --set-enum (e.g. AcquisitionAccumulationMode reporting "not
-		// readable"/"not writable") — this tells you WHY (IsAvailable/
-		// IsReadable/IsWritable) and often the camera's own ToolTip text names
-		// the gating condition in plain English.
-		if (!args.nodeInfoName.empty())
-		{
-			GenApi::CNodePtr pNode = pNodeMap->GetNode(args.nodeInfoName.c_str());
-			if (!pNode.IsValid())
-			{
-				std::cout << args.nodeInfoName << ": not found" << std::endl;
-			}
-			else
-			{
-				std::cout << std::boolalpha;
-				std::cout << args.nodeInfoName << ":\n"
-					<< "  IsAvailable = " << GenApi::IsAvailable(pNode) << "\n"
-					<< "  IsReadable  = " << GenApi::IsReadable(pNode) << "\n"
-					<< "  IsWritable  = " << GenApi::IsWritable(pNode) << "\n"
-					<< "  ToolTip     = " << pNode->GetToolTip() << "\n"
-					<< "  Description = " << pNode->GetDescription() << "\n";
-			}
-			pSystem->DestroyDevice(pDevice);
-			Arena::CloseSystem(pSystem);
-			return 0;
-		}
-
-		// --set-enum <Name> --set-enum-value <Value>: set a single enum node
-		// directly, without recording, reusing ApplyEnumIfPresent's writable-
-		// check + read-back-verify logic. Useful for probing whether a node
-		// that looks locked (IsWritable=false) actually accepts a write when
-		// tried directly, and for one-off experiments (e.g. trying
-		// AcquisitionAccumulationMode=EventBased) without a full recording run.
-		if (!args.setEnumName.empty())
-		{
-			if (args.setEnumValue.empty())
-			{
-				std::cerr << "Error: --set-enum requires --set-enum-value to also be specified." << std::endl;
-			}
-			else
-			{
-				ApplyEnumIfPresent(pNodeMap, args.setEnumName.c_str(), args.setEnumValue, /*required=*/true);
-			}
-			pSystem->DestroyDevice(pDevice);
-			Arena::CloseSystem(pSystem);
-			return 0;
-		}
-
-		// ── Recording path: register disconnect callback NOW ─────────
-		// Only reached when actually recording. Deregistered explicitly
-		// before DestroyDevice on both the success and failure paths below.
-		pSystem->RegisterDeviceDisconnectCallback(pDevice, &disconnectCb);
-		disconnectCbRegistered = true;
-
-		LoadFeaturesIfRequested(pNodeMap, args.loadFeaturesPath);
-
-		// Both required (ParseArgs enforces this) and both now confirm-read-back
-		// after SetIntValue — see ApplyEnumIfPresent. This is the camera's ONE
-		// real, confirmed decode path; there is no XYPT request anymore (see
-		// the removed-TryApplyOutputFormat comment above SECTION 9/10 for why).
-		ApplyEnumIfPresent(pNodeMap, "EventFormat", args.eventFormatName, true);
-		ApplyEnumIfPresent(pNodeMap, "EventFormatSize", args.eventFormatSizeName, true);
-
-		g_debugBufferCount = args.debugBuffers;
-
-		SetStreamBufferHandlingModeOldestFirst(pTLStreamNodeMap);
-
-		uint64_t payloadSizeFromNode = GetStreamPayloadSize(pTLStreamNodeMap);
-		if (payloadSizeFromNode == 0)
-		{
-			std::cerr << "[warning] Could not read 'PayloadSize' from the stream node map; "
-				<< "will size the ring buffer from the first captured buffer instead." << std::endl;
-		}
-
-		// Network tuning - see TryEnableBoolean's doc comment for the honesty
-		// caveat on these two node names (not yet confirmed against this
-		// camera's TL Stream node map). Failure here is non-fatal by design.
-		TryEnableBoolean(pTLStreamNodeMap, "StreamPacketResendEnable", true);
-		TryEnableBoolean(pTLStreamNodeMap, "StreamAutoNegotiatePacketSize", true);
-
-		// ERC (Event Rate Control) status - always printed, whether or not
-		// --erc-rate-limit is used, so every recording has a paper trail of
-		// what limit was active. IMPORTANT CAVEAT (confirmed via
-		// --dump-nodes --filter Erc against the real TRT009S-E): there is
-		// NO node that counts events ERC silently discards. If the true
-		// event rate exceeds ErcRateLimit, data is lost with zero visibility
-		// from host-side counters (gvspMissedPackets/incomplete/queueDrops
-		// all stay 0, because from the host's perspective those events never
-		// existed). Raising the limit is the only real mitigation available.
-		if (args.ercRateLimit > 0)
-			TrySetFloat(pNodeMap, "ErcRateLimit", args.ercRateLimit);
-		{
-			double curLimit = ReadFloatNode(pNodeMap, "ErcRateLimit");
-			std::cout << "[erc] Current ErcRateLimit = "
-				<< (curLimit >= 0 ? std::to_string(curLimit) + " Mev/s" : "unreadable")
-				<< "  (LUCID's own recommendation for 1GigE is 40; events above this "
-				<< "limit are dropped INSIDE the camera with no host-visible counter)"
-				<< std::endl;
-		}
-
-		outFile.open(args.outputPath, std::ios::binary | std::ios::trunc);
-		if (!outFile.is_open())
-			throw std::runtime_error("Could not open output file: " + args.outputPath);
-
-		pDevice->StartStream(args.numBuffers);
-		std::cout << "Stream started. Recording to " << args.outputPath << " ..." << std::endl;
-
-		// ---- One-time setup: capture the first buffer to learn geometry and
-		// pixel format, write the file header, then hand off to the
-		// steady-state threads for everything after it. ----
-		Arena::IBuffer* pFirst = pDevice->GetBuffer(5000);
-		DiagnoseFirstBuffer(pFirst);
-
-		FileHeader fileHeader{};
-		std::memcpy(fileHeader.magic, "CAROEVT1", 8);
-		fileHeader.reserved = 0;
-
-		if (pFirst->HasImageData())
-		{
-			Arena::IImage* pFirstImage = pFirst->AsImage();
-			fileHeader.pixelFormat = pFirstImage->GetPixelFormat();
-			fileHeader.bitsPerPixel = static_cast<uint32_t>(pFirstImage->GetBitsPerPixel());
-			fileHeader.width = static_cast<uint32_t>(pFirstImage->GetWidth());
-			fileHeader.height = static_cast<uint32_t>(pFirstImage->GetHeight());
-		}
-		else
-		{
-			// Payload is not image-typed (see diagnostic line just printed).
-			// Rather than crash, record what we do know (payload type) and
-			// leave geometry as 0/unknown - the raw bytes are still captured
-			// losslessly for offline analysis in Phase 5.
-			std::cerr << "[warning] First buffer is not image-typed (payloadType="
-				<< pFirst->GetPayloadType() << "). Recording payload bytes verbatim; "
-				<< "geometry fields in the file header will be 0 (unknown)." << std::endl;
-			fileHeader.pixelFormat = static_cast<uint64_t>(pFirst->GetPayloadType());
-			fileHeader.bitsPerPixel = 0;
-			fileHeader.width = 0;
-			fileHeader.height = 0;
-		}
-		outFile.write(reinterpret_cast<const char*>(&fileHeader), sizeof(fileHeader));
-
-		RecordHeader firstHdr{};
-		firstHdr.frameId = pFirst->GetFrameId();
-		firstHdr.timestampNs = pFirst->HasImageData() ? pFirst->AsImage()->GetTimestampNs() : 0;
-		firstHdr.payloadSize = static_cast<uint64_t>(pFirst->GetSizeFilled());
-		outFile.write(reinterpret_cast<const char*>(&firstHdr), sizeof(firstHdr));
-		outFile.write(reinterpret_cast<const char*>(pFirst->GetData()),
-			static_cast<std::streamsize>(firstHdr.payloadSize));
-
-		g_stats.bytesWritten.fetch_add(sizeof(fileHeader) + sizeof(firstHdr) + firstHdr.payloadSize,
-			std::memory_order_relaxed);
-		g_stats.recordsWritten.fetch_add(1, std::memory_order_relaxed);
-		g_stats.buffersAcquired.fetch_add(1, std::memory_order_relaxed);
-
-		pDevice->RequeueBuffer(pFirst);
-		g_stats.buffersRequeued.fetch_add(1, std::memory_order_relaxed);
-
-		std::cout << "Detected stream geometry: " << fileHeader.width << "x" << fileHeader.height
-			<< ", pixelFormat=0x" << std::hex << fileHeader.pixelFormat << std::dec
-			<< ", bitsPerPixel=" << fileHeader.bitsPerPixel << std::endl;
-
-		// ---- Ring buffer sizing (FIXED): take whichever estimate is LARGER —
-		// the TL stream 'PayloadSize' node, or the size of the buffer we just
-		// actually observed. Earlier versions trusted only the node value and
-		// silently truncated every subsequent buffer to a too-small slot size
-		// whenever the node under-reported the true buffer size (confirmed to
-		// happen on this camera: node reported far less than the real ~900KB
-		// buffers, causing every non-first record to be cut down to a fixed,
-		// wrong size). Taking the max of both, with a safety multiplier, means
-		// a single undersized node reading can no longer silently corrupt the
-		// whole recording.
-		const uint64_t candidateFromNode = payloadSizeFromNode > 0 ? payloadSizeFromNode : 0;
-		const uint64_t candidateFromFirstBuffer = firstHdr.payloadSize;
-		const uint64_t bestEstimate = (std::max)(candidateFromNode, candidateFromFirstBuffer);
-		const size_t slotCapacity = static_cast<size_t>(bestEstimate) * 2; // safety margin
-
-		if (candidateFromFirstBuffer > candidateFromNode * 2)
-		{
-			std::cerr << "[warning] TL stream 'PayloadSize' node (" << candidateFromNode
-				<< " bytes) badly under-estimated the real first buffer size ("
-				<< candidateFromFirstBuffer << " bytes). Sizing the ring buffer from the "
-				<< "observed buffer instead - this is exactly the mismatch that caused "
-				<< "silent truncation in earlier runs." << std::endl;
-		}
-
-		const double footprintMiB =
-			static_cast<double>(args.queueSlots) * static_cast<double>(slotCapacity) / (1024.0 * 1024.0);
-		std::cout << "Ring buffer: " << args.queueSlots << " slots x " << slotCapacity
-			<< " bytes = " << footprintMiB << " MiB resident." << std::endl;
-
-		// ---- Steady state: spin up the two worker threads ----
-		SpscByteRing ring(args.queueSlots, slotCapacity);
-
-		std::thread acqThread(AcquisitionThreadFunc, pDevice, std::ref(ring), std::ref(g_stopRequested));
-		std::thread writerThread(WriterThreadFunc, std::ref(ring), std::ref(outFile), std::ref(g_stopRequested));
-
-		const auto startTime = std::chrono::steady_clock::now();
-		uint64_t lastBytesWritten = 0;
-
-		while (!g_stopRequested.load(std::memory_order_relaxed))
-		{
-			std::this_thread::sleep_for(std::chrono::seconds(args.statsIntervalSeconds));
-
-			if (args.durationSeconds > 0)
-			{
-				const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-					std::chrono::steady_clock::now() - startTime).count();
-				if (static_cast<uint64_t>(elapsed) >= args.durationSeconds)
-					g_stopRequested.store(true, std::memory_order_relaxed);
-			}
-
-			const uint64_t bytesNow = g_stats.bytesWritten.load(std::memory_order_relaxed);
-			const double throughputMBs =
-				static_cast<double>(bytesNow - lastBytesWritten) / (1024.0 * 1024.0)
-				/ static_cast<double>(args.statsIntervalSeconds);
-			lastBytesWritten = bytesNow;
-
-			const uint64_t missedPackets = ReadStreamIntegerNode(pTLStreamNodeMap, "StreamMissedPacketCount");
-			const uint64_t lostFrames = ReadStreamIntegerNode(pTLStreamNodeMap, "StreamLostFrameCount");
-
-			std::cout << "[stats] acquired=" << g_stats.buffersAcquired.load(std::memory_order_relaxed)
-				<< " requeued=" << g_stats.buffersRequeued.load(std::memory_order_relaxed)
-				<< " incomplete=" << g_stats.incompleteBuffers.load(std::memory_order_relaxed)
-				<< " queueDrops=" << g_stats.queueOverflowDrops.load(std::memory_order_relaxed)
-				<< " truncated=" << ring.TruncationCount()
-				<< " reconnects=" << g_stats.reconnectEvents.load(std::memory_order_relaxed)
-				<< " records=" << g_stats.recordsWritten.load(std::memory_order_relaxed)
-				<< " bytesWritten=" << bytesNow
-				<< " throughput=" << throughputMBs << "MB/s"
-				<< " gvspMissedPackets=" << missedPackets
-				<< " gvspLostFrames=" << lostFrames
-				<< std::endl;
-		}
-
-		std::cout << "Stopping..." << std::endl;
-		acqThread.join();
-		writerThread.join();
-
-		pDevice->StopStream();
-		outFile.flush();
-		outFile.close();
-
-		std::cout << "Final stats: acquired=" << g_stats.buffersAcquired.load()
-			<< " requeued=" << g_stats.buffersRequeued.load()
-			<< " incomplete=" << g_stats.incompleteBuffers.load()
-			<< " queueDrops=" << g_stats.queueOverflowDrops.load()
-			<< " truncated=" << ring.TruncationCount()
-			<< " reconnects=" << g_stats.reconnectEvents.load()
-			<< " records=" << g_stats.recordsWritten.load()
-			<< " bytesWritten=" << g_stats.bytesWritten.load()
-			<< std::endl;
-
-		// Symmetric with the failure-path cleanup below: deregister the
-		// disconnect callback before destroying the device. DestroyDevice's
-		// docblock (Arena/ISystem.h) only promises to close an open stream,
-		// deallocate node maps, and close the message/control channels - it
-		// does NOT explicitly promise to deregister disconnect callbacks, so
-		// this is done explicitly here rather than assumed.
-		if (disconnectCbRegistered)
-		{
-			pSystem->DeregisterDeviceDisconnectCallback(&disconnectCb);
-			disconnectCbRegistered = false;
-		}
-		pSystem->DestroyDevice(pDevice);
-		Arena::CloseSystem(pSystem);
+	if (args.showHelp || argc == 1) {
+		PrintUsage(argv[0]);
 		return 0;
 	}
-	catch (GenICam::GenericException& e)
-	{
-		std::cerr << "[fatal] GenICam exception: " << e.GetDescription() << std::endl;
-	}
-	catch (std::exception& e)
-	{
-		std::cerr << "[fatal] " << e.what() << std::endl;
+
+	if (!args.infoOnly && args.outputPath.empty()) {
+		std::cerr << "[error] --output is required (or use --info)\n\n";
+		PrintUsage(argv[0]);
+		return 2;
 	}
 
-	// Best-effort cleanup on any failure path above.
-	if (outFile.is_open())
-		outFile.close();
-	if (pDevice != nullptr && pSystem != nullptr)
-	{
-		try
-		{
-			if (disconnectCbRegistered)
-				pSystem->DeregisterDeviceDisconnectCallback(&disconnectCb);
-			pSystem->DestroyDevice(pDevice);
+	// Install handlers before opening the camera: a Ctrl-C during a slow
+	// device open should not kill the process in a way that leaves the GigE
+	// control channel claimed.
+	std::signal(SIGINT,  HandleSignal);
+	std::signal(SIGTERM, HandleSignal);
+
+	// -----------------------------------------------------------------------
+	// Open camera
+	// -----------------------------------------------------------------------
+	Metavision::Camera cam;
+	try {
+		if (args.serial.empty()) {
+			std::cout << "[open] Opening first available camera...\n";
+			cam = Metavision::Camera::from_first_available();
+		} else {
+			std::cout << "[open] Opening camera with serial " << args.serial << "...\n";
+			cam = Metavision::Camera::from_serial(args.serial);
 		}
-		catch (...) {}
+	} catch (const Metavision::CameraException &e) {
+		std::cerr << "[fatal] Could not open camera: " << e.what() << "\n"
+		          << "        Checklist:\n"
+		          << "          1. MV_HAL_PLUGIN_PATH includes LUCID's hal_plugin directory\n"
+		          << "          2. LD_LIBRARY_PATH includes .../Metavision/lib\n"
+		          << "          3. No Arena-based process (ArenaView, evs_recorder) holds\n"
+		          << "             the camera -- only one process may claim the GigE Vision\n"
+		          << "             control channel at a time\n";
+		return 1;
 	}
-	if (pSystem != nullptr)
-	{
-		try { Arena::CloseSystem(pSystem); }
-		catch (...) {}
+
+	// -----------------------------------------------------------------------
+	// Bias profile — applied BEFORE start, since biases change what the
+	// sensor generates, not how it is read out.
+	// -----------------------------------------------------------------------
+	if (!args.biasFileIn.empty()) {
+		try {
+			cam.biases().set_from_file(args.biasFileIn);
+			std::cout << "[bias] Loaded bias profile: " << args.biasFileIn << "\n";
+		} catch (const Metavision::CameraException &e) {
+			// Hard failure on purpose. Silently recording with default biases
+			// after being told to use a calibrated profile would produce data
+			// that looks valid and is scientifically wrong.
+			std::cerr << "[fatal] Failed to load bias file '" << args.biasFileIn
+			          << "': " << e.what() << "\n";
+			ExitNow(1);
+		}
 	}
-	return 1;
+
+	// -----------------------------------------------------------------------
+	// ERC — after biases, before recording.
+	//
+	// --erc-off and --erc-rate are mutually exclusive in effect; --erc-off
+	// wins if both are given, since disabling is the more conservative
+	// request and is what calibration runs need (ERC drops events, which
+	// masks the true noise floor).
+	// -----------------------------------------------------------------------
+	if (args.ercOff || args.ercRate > 0) {
+		Metavision::I_ErcModule *erc = cam.get_device().get_facility<Metavision::I_ErcModule>();
+		if (!erc) {
+			std::cerr << "[warning] ERC was requested but this plugin exposes no I_ErcModule "
+			             "facility. Continuing with the camera's current ERC state.\n";
+		} else if (args.ercOff) {
+			if (erc->enable(false)) {
+				std::cout << "[erc] Disabled.\n";
+			} else {
+				std::cerr << "[warning] ERC disable was rejected by the device.\n";
+			}
+		} else {
+			const uint32_t lo = erc->get_min_supported_cd_event_rate();
+			const uint32_t hi = erc->get_max_supported_cd_event_rate();
+			if (args.ercRate < lo || args.ercRate > hi) {
+				std::cerr << "[fatal] --erc-rate " << args.ercRate
+				          << " is outside the supported range [" << lo << ", " << hi
+				          << "] events/sec for this camera.\n";
+				ExitNow(2);
+			}
+			if (erc->set_cd_event_rate(args.ercRate) && erc->enable(true)) {
+				std::cout << "[erc] Enabled at " << args.ercRate << " events/sec ("
+				          << (args.ercRate / 1000000.0) << " Mev/s).\n";
+			} else {
+				std::cerr << "[warning] ERC configuration was rejected by the device; "
+				             "continuing with its current state.\n";
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Introspect AFTER bias/ERC changes so what is reported and saved to the
+	// sidecar is what is actually in effect, not what it was at open time.
+	// -----------------------------------------------------------------------
+	CameraInfo info = CollectCameraInfo(cam);
+	PrintCameraInfo(info);
+
+	if (!args.biasFileOut.empty()) {
+		try {
+			cam.biases().save_to_file(args.biasFileOut);
+			std::cout << "[bias] Saved effective biases to: " << args.biasFileOut << "\n";
+		} catch (const Metavision::CameraException &e) {
+			std::cerr << "[warning] Could not save bias file '" << args.biasFileOut
+			          << "': " << e.what() << "\n";
+		}
+	}
+
+	if (args.infoOnly) {
+		std::cout << "[info] --info requested; not recording.\n";
+		ExitNow(0);
+	}
+
+	// -----------------------------------------------------------------------
+	// Statistics callback.
+	//
+	// Runs on the SDK's decoding thread and receives a half-open [begin, end)
+	// range per invocation, NOT one call per event. Kept to integer
+	// arithmetic only: no I/O, no allocation, no locking. If this thread
+	// stalls, the SDK's internal queues back up and events are lost.
+	// -----------------------------------------------------------------------
+	cam.cd().add_callback([](const Metavision::EventCD *begin, const Metavision::EventCD *end) {
+		uint64_t n = 0, pos = 0;
+		int64_t  lastT = 0;
+		for (const Metavision::EventCD *it = begin; it != end; ++it) {
+			++n;
+			if (it->p > 0) ++pos;
+			lastT = static_cast<int64_t>(it->t);
+		}
+		if (n == 0) return;
+		g_stats.totalEvents.fetch_add(n, std::memory_order_relaxed);
+		g_stats.positiveEvents.fetch_add(pos, std::memory_order_relaxed);
+		g_stats.negativeEvents.fetch_add(n - pos, std::memory_order_relaxed);
+		g_stats.lastEventTimestampUs.store(lastT, std::memory_order_relaxed);
+	});
+
+	// -----------------------------------------------------------------------
+	// Start recording BEFORE start(): the SDK writer must be attached when
+	// the first events arrive, otherwise the head of the stream is lost.
+	// -----------------------------------------------------------------------
+	if (!cam.start_recording(args.outputPath)) {
+		std::cerr << "[fatal] start_recording('" << args.outputPath << "') failed. "
+		             "Check the path is writable and the directory exists.\n";
+		ExitNow(1);
+	}
+	std::cout << "[rec] Writing sparse events to: " << args.outputPath << "\n";
+
+	const std::string startedUtc = UtcTimestampString();
+	const auto        startWall  = std::chrono::steady_clock::now();
+
+	cam.start();
+
+	if (args.durationSec > 0) {
+		std::cout << "[rec] Recording for " << args.durationSec
+		          << " s (Ctrl-C stops early).\n";
+	} else {
+		std::cout << "[rec] Recording until Ctrl-C.\n";
+	}
+
+	// -----------------------------------------------------------------------
+	// Main loop. Polls rather than sleeps for the whole duration so Ctrl-C is
+	// responsive within ~50 ms even on a multi-hour capture.
+	// -----------------------------------------------------------------------
+	std::string stopReason = "unknown";
+	auto     lastStatsAt   = startWall;
+	uint64_t lastStatsCount = 0;
+
+	while (true) {
+		if (g_stopRequested.load(std::memory_order_relaxed)) {
+			stopReason = "signal (Ctrl-C / SIGTERM)";
+			break;
+		}
+		if (!cam.is_running()) {
+			// The SDK stopped on its own: device unplugged, link dropped, or
+			// an internal error. Not a normal path, so it is named as such in
+			// the sidecar rather than reported as a clean finish.
+			stopReason = "camera stopped unexpectedly";
+			break;
+		}
+
+		const auto now     = std::chrono::steady_clock::now();
+		const double elapsed = std::chrono::duration<double>(now - startWall).count();
+
+		if (args.durationSec > 0 && elapsed >= args.durationSec) {
+			stopReason = "duration reached";
+			break;
+		}
+
+		if (args.statsInterval > 0) {
+			const double sinceStats = std::chrono::duration<double>(now - lastStatsAt).count();
+			if (sinceStats >= args.statsInterval) {
+				const uint64_t total = g_stats.totalEvents.load(std::memory_order_relaxed);
+				const uint64_t delta = total - lastStatsCount;
+				const double   rate  = (sinceStats > 0) ? (delta / sinceStats) : 0.0;
+
+				std::cout << "[stats] t=" << std::fixed << std::setprecision(1) << elapsed << "s"
+				          << "  events=" << total
+				          << "  rate=" << std::setprecision(2) << (rate / 1e6) << " Mev/s"
+				          << "  ON=" << g_stats.positiveEvents.load(std::memory_order_relaxed)
+				          << "  OFF=" << g_stats.negativeEvents.load(std::memory_order_relaxed)
+				          << std::endl;
+
+				lastStatsAt    = now;
+				lastStatsCount = total;
+			}
+		}
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+
+	// -----------------------------------------------------------------------
+	// Shutdown. Order matters: stop the camera first so no new events are
+	// produced, then close the file, then report.
+	// -----------------------------------------------------------------------
+	std::cout << "\n[rec] Stopping (" << stopReason << ")...\n";
+
+	try {
+		cam.stop();
+	} catch (const Metavision::CameraException &e) {
+		std::cerr << "[warning] camera stop reported: " << e.what() << "\n";
+	}
+
+	try {
+		if (!cam.stop_recording(args.outputPath)) {
+			std::cerr << "[warning] stop_recording() returned false; the .raw may be "
+			             "truncated. Verify it before relying on this run.\n";
+		}
+	} catch (const Metavision::CameraException &e) {
+		std::cerr << "[warning] stop_recording reported: " << e.what() << "\n";
+	}
+
+	const std::string stoppedUtc  = UtcTimestampString();
+	const double      wallSeconds =
+		std::chrono::duration<double>(std::chrono::steady_clock::now() - startWall).count();
+
+	// Refresh bias/ERC state for the sidecar: ERC in particular can be
+	// changed by the device itself under load.
+	info = CollectCameraInfo(cam);
+
+	std::string sidecarError;
+	if (WriteSidecar(args.outputPath, info, args, startedUtc, stoppedUtc,
+	                 wallSeconds, stopReason, sidecarError)) {
+		std::cout << "[meta] Wrote " << args.outputPath << ".meta.json\n";
+	} else {
+		std::cerr << "[warning] Sidecar not written: " << sidecarError << "\n";
+	}
+
+	const uint64_t total = g_stats.totalEvents.load(std::memory_order_relaxed);
+	const uint64_t pos   = g_stats.positiveEvents.load(std::memory_order_relaxed);
+	const uint64_t neg   = g_stats.negativeEvents.load(std::memory_order_relaxed);
+
+	std::cout << "\n[done] " << args.outputPath << "\n"
+	          << "[done] wall time        = " << std::fixed << std::setprecision(2)
+	          << wallSeconds << " s\n"
+	          << "[done] events observed  = " << total
+	          << "  (ON=" << pos << ", OFF=" << neg << ")\n";
+	if (wallSeconds > 0) {
+		std::cout << "[done] average rate     = " << std::setprecision(3)
+		          << (total / wallSeconds / 1e6) << " Mev/s\n";
+	}
+
+	if (total == 0) {
+		std::cout << "[done] WARNING: zero events. Either nothing moved in the scene, or\n"
+		             "       the lens cap is on, or biases are set far too insensitive.\n";
+	}
+
+	// See the file header: leaving through _Exit avoids a known
+	// boost::lock_error abort inside the bundled libraries' static
+	// destructors. All output is already durable at this point.
+	ExitNow(0);
 }

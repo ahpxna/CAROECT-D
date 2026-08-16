@@ -4,31 +4,41 @@
 # ═══════════════════════════════════════════════════════════════════
 #  pipeline.sh cũ dừng ở bước events.h5 (chỉ preprocess + v2e). Bản này
 #  chạy hết: preprocess -> simulate(v2e+dvsvolt) -> SAM3 tracks -> label transfer ->
-#  build dataset -> train -> eval. record_evs.py/read_evt3.py (Metavision
-#  SDK, .raw EVT3.0) KHÔNG còn dùng — nhánh event thật giờ đi qua
-#  evs_recorder.cpp (Arena SDK, EVT3.0 + EventFormatSize bắt buộc, KHÔNG có
-#  XYPT — node đó đã xác nhận không tồn tại trên firmware TRT009S-E, xem
-#  comment đầu evs_recorder.cpp) -> cevt_to_events.py --output-h5.
-#  xypt_to_h5.py KHÔNG còn dùng nữa (chết theo XYPT).
+#  build dataset -> train -> eval. Nhánh event thật CHỈ CÒN 1 recorder đang
+#  dùng (evs_recorder.cpp giờ LÀ bản Metavision — bản Arena SDK cũ đã bị THAY
+#  THẾ hoàn toàn, không phải chạy song song):
+#    evs_recorder.cpp (Metavision, hiện tại) -> .raw  SPARSE (x,y,p,t), t thật µs
+#                          (xác nhận qua probe_metavision.cpp) -> raw_to_events.py
+#    legacy/evs_recorder.cpp (Arena SDK, RETIRED) -> .cevt DENSE accumulated
+#                          frame (AcquisitionAccumulationMode khoá cứng
+#                          firmware, không có sparse output qua Arena — xem
+#                          comment đầu legacy/evs_recorder.cpp) ->
+#                          legacy/cevt_to_events.py. Giữ nhánh này CHỈ để đọc
+#                          lại các file .cevt đã quay TRƯỚC khi đổi sang
+#                          Metavision — không quay mới bằng đường này nữa.
+#  run_pipeline.sh real tự nhận diện đuôi file, gọi đúng converter.
+#  record_evs.py/read_evt3.py (Metavision cũ)/xypt_to_h5.py/cevt_to_h5.py
+#  KHÔNG còn dùng (nằm trong legacy/, không được run_pipeline.sh gọi tới).
 #
 #  Usage:
 #    ./run_pipeline.sh sim   <davinci_tiff_dir> <session_name> <split>
 #        # preprocess -> simulate (v2e+dvsvolt) -> SAM3 all classes -> label transfer
 #        # -> build dataset (2 simulator variants, cho split train|val|test)
 #
-#    ./run_pipeline.sh real  <site.cevt> <session_name>
-#        # cevt_to_events.py --output-h5 -> events_real.h5 (dùng cho
-#        # calibrate_simulator.py HOẶC làm real test set qua
-#        # build_event_dataset.py thủ công). Trước khi tin số t cho việc
-#        # calibrate, chạy chẩn đoán liên tục thời gian trước:
-#        #   python cevt_to_events.py <site.cevt> --debug-time-continuity
-#        # nếu nó cho thấy TIME_LOW/TIME_HIGH nối liền qua các record thay
-#        # vì reset mỗi record, set REAL_EVT3_CONTINUOUS_TIME=1 rồi chạy lại.
+#    ./run_pipeline.sh real  <site.raw | site.cevt> <session_name>
+#        # .raw  (evs_recorder.cpp hiện tại, Metavision, SPARSE) -> raw_to_events.py
+#        #       real per-event µs timestamps, no --fps/continuity check needed.
+#        #       Đường dùng cho MỌI recording mới.
+#        # .cevt (legacy/evs_recorder.cpp, Arena, DENSE, ĐÃ RETIRED) ->
+#        #       legacy/cevt_to_events.py — chỉ để đọc lại data cũ đã quay
+#        #       trước khi pivot sang Metavision. frame-quantised t; chạy
+#        #       --debug-time-continuity trước:
+#        #   python legacy/cevt_to_events.py <site.cevt> --debug-time-continuity
 #
 #    ./run_pipeline.sh calibrate <events_real.h5> <processed_tiff_dir> <simulator> <param> <values...>
 #        # vd: ./run_pipeline.sh calibrate data/events_real/site01.h5 data/processed/site01 v2e pos_thres 0.15 0.2 0.25 0.3
 #
-#    ./run_pipeline.sh calibrate-eq23 <events_real.h5> <gray_gradient_tiff_dir> [v2e|dvsvolt]
+#    ./run_pipeline.sh calibrate-eq30 <events_real.h5> <gray_gradient_tiff_dir> [v2e|dvsvolt]
 #        # physical C_real = ΔlogL / Nbar(ΔlogL); --apply maps directly to v2e thresholds
 #
 #    ./run_pipeline.sh train  <dataset_root>
@@ -47,8 +57,12 @@ DVS_ENV="${DVS_ENV:-dvsvolt}"
 LABEL_STATS="${LABEL_STATS:-0}"
 DENSE_LABELS="${DENSE_LABELS:-0}"   # xem review: mặc định TẮT vì O(n_events x n_tracks) Python thuần, có thể mất hàng giờ trên site thật. Bật tay khi cần debug occlusion: LABEL_STATS=1 DENSE_LABELS=1 ./run_pipeline.sh sim ...
 EXPORT_COCO="${EXPORT_COCO:-1}"
-REAL_FPS="${REAL_FPS:-30.0}"                              # cevt_to_events.py --fps: chỉ dùng khi 1 record fallback về dense-frame; EVT3.0 record dùng t thật giải mã từ payload
-REAL_EVT3_CONTINUOUS_TIME="${REAL_EVT3_CONTINUOUS_TIME:-0}"  # xem cevt_to_events.py --debug-time-continuity trước khi bật cái này
+# Không đặt default REAL_FPS nữa: cevt_to_events.py giờ ưu tiên
+# device/host timestamp thật, --fps chỉ là phương án cuối cùng (fallback
+# "synthesized") khi file .cevt không có gì đo được. Đặt mặc định 30.0 ở
+# đây trước kia sẽ ÂM THẦM che luôn cảnh báo "synthesized" — để trống,
+# chỉ set REAL_FPS=<hz> khi thật sự cần và biết rõ giá trị đúng.
+REAL_FPS="${REAL_FPS:-}"
  
 run_py() {
   python "$@"
@@ -66,7 +80,7 @@ run_env() {
 }
  
 usage() {
-  echo "Usage: ./run_pipeline.sh {sim|real|calibrate|calibrate-eq23|train|eval} ..."
+  echo "Usage: ./run_pipeline.sh {sim|real|calibrate|calibrate-eq30|train|eval} ..."
   echo "  Xem comment đầu file này để biết đúng cú pháp từng lệnh."
   exit 1
 }
@@ -142,18 +156,36 @@ case "$CMD" in
     ;;
  
   real)
-    CEVT="${2:?<site.cevt>}"
+    INFILE="${2:?<site.cevt | site.raw>}"
     SESSION="${3:?<session_name>}"
     OUT="data/events_real/${SESSION}.h5"
     mkdir -p "$(dirname "$OUT")"
-    echo "═══ Real event: .cevt (CAROEVT1, EVT3.0) -> events.h5 ═══"
-    echo "  [reminder] chưa chạy chẩn đoán liên tục t? Chạy trước:"
-    echo "    python cevt_to_events.py ${CEVT} --debug-time-continuity"
-    CONT_FLAG=()
-    if [ "$REAL_EVT3_CONTINUOUS_TIME" = "1" ]; then
-      CONT_FLAG=(--evt3-continuous-time)
-    fi
-    run_py cevt_to_events.py "${CEVT}" --output-h5 "${OUT}" --fps "${REAL_FPS}" "${CONT_FLAG[@]}"
+
+    case "$INFILE" in
+      *.raw)
+        echo "═══ Real event: .raw (Metavision, evs_recorder.cpp, SPARSE) -> events.h5 ═══"
+        echo "  Real per-event µs timestamps — no --fps needed, no continuity check needed"
+        echo "  (that diagnostic is only meaningful for the dense/.cevt path)."
+        run_py raw_to_events.py "${INFILE}" --output "${OUT}"
+        ;;
+      *.cevt)
+        echo "═══ Real event: .cevt (Arena, CAROEVT1/2, DENSE accumulated, LEGACY) -> events.h5 ═══"
+        echo "  [note] evs_recorder.cpp không còn ghi .cevt nữa (đã pivot sang Metavision/.raw)."
+        echo "  Nhánh này chỉ để đọc lại data cũ — converter nằm ở legacy/cevt_to_events.py."
+        echo "  [reminder] chưa chạy chẩn đoán thời gian? Chạy trước:"
+        echo "    python legacy/cevt_to_events.py ${INFILE} --debug-time-continuity"
+        FPS_FLAG=()
+        if [ -n "${REAL_FPS:-}" ]; then
+          FPS_FLAG=(--fps "${REAL_FPS}")
+        fi
+        run_py legacy/cevt_to_events.py "${INFILE}" --output-h5 "${OUT}" "${FPS_FLAG[@]}"
+        ;;
+      *)
+        echo "Không nhận diện được đuôi file: ${INFILE} (cần .raw hoặc .cevt)" >&2
+        exit 1
+        ;;
+    esac
+
     echo ""
     echo "✓ ${OUT}"
     echo "  Dùng cho: ./run_pipeline.sh calibrate ${OUT} <processed_tiff_dir>"
@@ -180,16 +212,16 @@ case "$CMD" in
     echo "  Chạy lại ./run_pipeline.sh sim ... để dùng θ mới calibrate"
     ;;
  
-  calibrate-eq23)
+  calibrate-eq30)
     EVENTS_REAL="${2:?<events_real.h5>}"
     GRAY_TIFF_DIR="${3:?<gray_gradient_tiff_dir>}"
     SIMULATOR="${4:-v2e}"
-    echo "═══ Physical Eq.23 calibration (${SIMULATOR}) ═════════"
-    run_py calibrate_simulator.py --eq23 --real "${EVENTS_REAL}" \
+    echo "═══ Physical Eq.30 calibration (${SIMULATOR}) ═════════"
+    run_py calibrate_simulator.py --eq30 --real "${EVENTS_REAL}" \
       --sim-input "${GRAY_TIFF_DIR}" --simulator "${SIMULATOR}" \
       --config "$CFG" --apply
     echo ""
-    echo "✓ Eq.23 report -> _calib_work/eq23_estimate.json"
+    echo "✓ Eq.30 report -> _calib_work/eq30_estimate.json"
     ;;
  
   train)

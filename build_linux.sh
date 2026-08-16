@@ -1,146 +1,93 @@
 #!/usr/bin/env bash
-# build_linux.sh — Build evs_recorder on Ubuntu/Linux with Arena SDK
-# Usage: bash build_linux.sh [/path/to/ArenaSDK]
-# If no path given, tries common install locations automatically.
-set -e
+# ============================================================================
+# build_linux.sh -- build evs_recorder.cpp (Metavision-based; renamed from
+# evs_recorder_mv.cpp / build_mv.sh once this became the ONLY recorder — the
+# old Arena-SDK evs_recorder.cpp that wrote .cevt is gone, see project notes)
+#
+# Uses EXACTLY the flag combination that was proven to link and run with
+# probe_metavision.cpp on this machine. Nothing here is guessed:
+#
+#   * Headers come from a source checkout of OpenEB 4.6.2, because the
+#     LUCID-bundled Metavision libraries are built from openeb 4.6.2 (confirmed
+#     via `strings libmetavision_hal.so.4.6.2` -> /builds/openeb/ + version
+#     4.6.2) and shipped WITHOUT headers. Matching the exact tag avoids ABI
+#     mismatch with the prebuilt .so files.
+#
+#   * libprotobuf.so.23 is NOT in Ubuntu 24.04 (which ships protobuf 3.21 as
+#     .so.32). libmetavision_sdk_driver.so hard-links against .so.23, so the
+#     ABI-correct .so.23 is extracted from a focal-era .deb and kept beside
+#     the Metavision libs. Installing libprotobuf-dev from noble does NOT
+#     fix this -- it is a different soname with different symbols.
+#
+#   * OpenCV is needed because libmetavision_sdk_driver/core reference
+#     cv::Mat in their public surface (CDFrameGenerator etc).
+#
+# Usage:  bash build_mv.sh
+# ============================================================================
+set -euo pipefail
 
-# ── 1. Find Arena SDK ─────────────────────────────────────────────
-if [ -n "$1" ]; then
-    ARENA="$1"
-else
-    # Common locations LUCID installers use on Ubuntu
-    for candidate in \
-        "$HOME/ArenaSDK" \
-        "$HOME/ArenaSDK_Linux_x64" \
-        "/opt/ArenaSDK" \
-        "/opt/lucid/ArenaSDK" \
-        "$(dirname "$0")/../ArenaSDK" \
-        "$(dirname "$0")/ArenaSDK"
-    do
-        if [ -d "$candidate/lib64" ] && [ -d "$candidate/include" ]; then
-            ARENA="$candidate"
-            break
-        fi
-    done
+ARENA_DIR="${ARENA_DIR:-$HOME/ArenaSDK_Linux_x64}"
+MV_DIR="$ARENA_DIR/Metavision"
+OPENEB_SRC="${OPENEB_SRC:-$HOME/openeb-4.6.2}"
+SRC="${1:-evs_recorder.cpp}"
+OUT="${OUT:-evs_recorder}"
+
+# ---- preflight -------------------------------------------------------------
+[ -f "$SRC" ] || { echo "ERROR: source not found: $SRC"; exit 1; }
+[ -d "$MV_DIR/lib" ] || { echo "ERROR: not found: $MV_DIR/lib"; exit 1; }
+
+if [ ! -d "$OPENEB_SRC" ]; then
+    echo "OpenEB 4.6.2 headers not found at $OPENEB_SRC"
+    echo "Fetching them (shallow clone, headers only usage):"
+    git clone --depth 1 --branch 4.6.2 https://github.com/prophesee-ai/openeb.git "$OPENEB_SRC"
 fi
 
-if [ -z "$ARENA" ] || [ ! -d "$ARENA/lib64" ]; then
-    echo "ERROR: Cannot find Arena SDK. Pass the path explicitly:"
-    echo "  bash build_linux.sh /path/to/ArenaSDK"
-    echo ""
-    echo "The folder should contain:  include/  lib64/  GenICam/"
-    exit 1
+# libprotobuf.so.23 shim -----------------------------------------------------
+if [ ! -f "$MV_DIR/lib/libprotobuf.so.23" ]; then
+    echo "libprotobuf.so.23 missing from $MV_DIR/lib -- fetching focal build..."
+    TMPD=$(mktemp -d)
+    ( cd "$TMPD"
+      wget -q http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb
+      dpkg -x libprotobuf23_3.12.4-1ubuntu7_amd64.deb pb )
+    cp "$TMPD"/pb/usr/lib/x86_64-linux-gnu/libprotobuf.so.23* "$MV_DIR/lib/"
+    rm -rf "$TMPD"
+    echo "  -> installed into $MV_DIR/lib"
 fi
 
-echo "Arena SDK found: $ARENA"
+# ---- flags -----------------------------------------------------------------
+MV_INC=(
+    -I"$OPENEB_SRC/hal/cpp/include"
+    -I"$OPENEB_SRC/sdk/modules/base/cpp/include"
+    -I"$OPENEB_SRC/sdk/modules/core/cpp/include"
+    -I"$OPENEB_SRC/sdk/modules/driver/cpp/include"
+    -I/usr/include/opencv4
+)
 
-# ── 2. Locate GenICam lib dir ─────────────────────────────────────
-GENICAM_INC="$ARENA/GenICam/library/CPP/include"
-GENICAM_LIB=""
-for candidate in \
-    "$ARENA/GenICam/library/lib/Linux64_x64" \
-    "$ARENA/GenICam/library/lib/Linux64" \
-    "$ARENA/GenICam/library/CPP/lib/Linux64_x64" \
-    "$ARENA/GenICam/library/CPP/lib/Linux64" \
-    "$ARENA/GenICam/library/CPP/lib"
-do
-    if [ -d "$candidate" ] && ls "$candidate"/libGCBase*.so &>/dev/null; then
-        GENICAM_LIB="$candidate"
-        break
-    fi
-done
+MV_LIB=(
+    -L"$MV_DIR/lib"
+    -Wl,-rpath,"$MV_DIR/lib"
+    -lmetavision_sdk_driver
+    -lmetavision_sdk_base
+    -lmetavision_hal
+    "$MV_DIR/lib/libprotobuf.so.23"
+)
 
-if [ -z "$GENICAM_LIB" ]; then
-    echo "ERROR: Cannot find GenICam .so files under $ARENA/GenICam/"
-    echo "Expected:  libGCBase_*.so  libGenApi_*.so  etc."
-    echo "Actual contents:"
-    find "$ARENA/GenICam" -name "*.so" 2>/dev/null | head -20
-    exit 1
-fi
-
-echo "GenICam lib:    $GENICAM_LIB"
-echo ""
-echo "Contents of lib64/:"
-ls "$ARENA/lib64/" 2>/dev/null || echo "  (empty or missing)"
-echo ""
-
-# ── 3. Discover .so names ─────────────────────────────────────────
-# Find the Arena core library first — it might have different names on Linux
-ARENA_CORE_LIB=""
-for name in libarena.so libArena.so libArena_v140.so libArena_gcc54.so; do
-    if [ -f "$ARENA/lib64/$name" ]; then
-        ARENA_CORE_LIB="${name#lib}"; ARENA_CORE_LIB="${ARENA_CORE_LIB%.so}"
-        break
-    fi
-done
-# Also try versioned symlinks (both cases)
-if [ -z "$ARENA_CORE_LIB" ]; then
-    found=$(ls "$ARENA/lib64/libarena"*.so* "$ARENA/lib64/libArena"*.so* 2>/dev/null | head -1)
-    if [ -n "$found" ]; then
-        base=$(basename "$found")
-        ARENA_CORE_LIB="${base#lib}"
-        ARENA_CORE_LIB="${ARENA_CORE_LIB%.so*}"
-    fi
-fi
-
-if [ -z "$ARENA_CORE_LIB" ]; then
-    echo "ERROR: Cannot find libArena*.so in $ARENA/lib64/"
-    echo "Files there:"
-    ls "$ARENA/lib64/" 2>/dev/null
-    exit 1
-fi
-echo "Arena core lib: -l$ARENA_CORE_LIB"
-
-arena_libs="-l$ARENA_CORE_LIB"
-for lib in \
-    libGCBase_gcc54_v3_3_LUCID.so \
-    libGenApi_gcc54_v3_3_LUCID.so \
-    libLog_gcc54_v3_3_LUCID.so \
-    liblog4cpp_gcc54_v3_3_LUCID.so \
-    libMathParser_gcc54_v3_3_LUCID.so \
-    libNodeMapData_gcc54_v3_3_LUCID.so \
-    libResUsageStat_gcc54_v3_3_LUCID.so \
-    libXmlParser_gcc54_v3_3_LUCID.so
-do
-    found_in=""
-    if   [ -f "$ARENA/lib64/$lib" ];  then found_in="$ARENA/lib64"
-    elif [ -f "$GENICAM_LIB/$lib" ]; then found_in="$GENICAM_LIB"
-    fi
-    if [ -n "$found_in" ]; then
-        flag="${lib#lib}"; flag="${flag%.so}"
-        arena_libs="$arena_libs -l$flag"
-    fi
-done
-
-echo "Link flags:     $arena_libs"
-echo ""
-
-# ── 4. Compile ────────────────────────────────────────────────────
-# -pthread is required on Linux for std::thread
-# -Wl,-rpath bakes the library search path INTO the binary so you don't
-# need to export LD_LIBRARY_PATH every time you run it.
-echo "Compiling evs_recorder.cpp ..."
-
-g++ -std=c++14 -O2 -pthread \
-    -I "$ARENA/include" \
-    -I "$GENICAM_INC" \
-    evs_recorder.cpp \
-    -L "$ARENA/lib64" \
-    -L "$GENICAM_LIB" \
-    $arena_libs \
-    -Wl,-rpath,"$ARENA/lib64" \
-    -Wl,-rpath,"$GENICAM_LIB" \
-    -o evs_recorder
+echo "Compiling $SRC -> $OUT ..."
+g++ -std=c++17 -O2 -g -pthread "$SRC" \
+    "${MV_INC[@]}" "${MV_LIB[@]}" \
+    $(pkg-config --libs opencv4) \
+    -o "$OUT"
 
 echo ""
-echo "✓ Build successful -> ./evs_recorder"
+echo "OK -> ./$OUT"
 echo ""
-echo "Test (camera must be connected and ArenaView closed):"
-echo "  ./evs_recorder --list-event-formats"
+echo "Run with (these MUST be exported, the plugin is not auto-discovered):"
 echo ""
-echo "Record 10 seconds:"
-echo "  ./evs_recorder --output test.cevt --event-format EVT3_0 --strict-xypt --flat-xypt --duration 10"
+echo "  export MV_HAL_PLUGIN_PATH=$MV_DIR/lib/metavision/hal/plugins:$MV_DIR/hal_plugin"
+echo "  export LD_LIBRARY_PATH=$MV_DIR/lib:\$LD_LIBRARY_PATH"
 echo ""
-echo "If you get 'error while loading shared libraries' despite -rpath, run once:"
-echo "  export LD_LIBRARY_PATH=$ARENA/lib64:$GENICAM_LIB:\$LD_LIBRARY_PATH"
-echo "  (add to ~/.bashrc to make permanent)"
+echo "  ./$OUT --info"
+echo "  ./$OUT --output run01.raw --duration 60"
+echo ""
+echo "Close ArenaView / evs_recorder first -- only one process can hold the"
+echo "GigE Vision control channel at a time."

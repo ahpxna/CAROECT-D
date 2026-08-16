@@ -21,7 +21,7 @@ tại đúng timestamp của từng event — đây chính là phương trình
 
 File này KHÔNG viết lại logic SAM3 — import lại propagate_in_video(),
 load_sorted_frame_paths(), draw_overlay(), write_yolo_label() từ
-sam3_video_to_labels.py (đúng pattern quick_tiff_to_jpg.py đã dùng), chỉ THÊM
+sam3_video_to_labels.py (đúng pattern quick_tiff_to_sam3.py đã dùng), chỉ THÊM
 bước ghi tracks.json giữ đúng thông tin track_id + timestamp mà bước ghi YOLO
 cũ đã làm mất.
 
@@ -213,7 +213,7 @@ def _run_one_prompt(predictor, video_folder: str, frame_paths: list[str], prompt
 def main():
     ap = argparse.ArgumentParser(
         description="SAM3 video -> tracks.json (giữ track_id + timestamp, xem module docstring)")
-    ap.add_argument("video_folder", help="Folder '0.jpg','1.jpg',... (output preprocess.py --output-rgb)")
+    ap.add_argument("video_folder", help="Folder '0.tiff','1.tiff',... (output preprocess.py --output-rgb / quick_tiff_to_sam3.py)")
     ap.add_argument("--prompt", default=None,
                     help="Một prompt đơn. Nếu bỏ trống và dùng --all-classes, lấy class list từ config.")
     ap.add_argument("--all-classes", action="store_true",
@@ -245,7 +245,7 @@ def main():
 
     frame_paths = load_sorted_frame_paths(args.video_folder)
     if not frame_paths:
-        raise FileNotFoundError(f"No .jpg/.jpeg/.png frames in {args.video_folder}")
+        raise FileNotFoundError(f"No .tif/.tiff frames in {args.video_folder}")
     print(f"{len(frame_paths)} frame(s) @ fps_original={fps}  "
           f"(duration={len(frame_paths)/fps:.2f}s)")
 

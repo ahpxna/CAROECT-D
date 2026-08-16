@@ -3,12 +3,17 @@
 measure_event_rate.py — Compare event-rate statistics across recordings.
 
 Built for the no-motion vs with-motion baseline measurement: convert both
-.cevt files first (cevt_to_events.py), then run this on the resulting .h5
-files to get a clean side-by-side comparison instead of eyeballing CD Frames.
+recordings to events.h5 first, then run this on the resulting .h5 files to
+get a clean side-by-side comparison instead of eyeballing CD Frames.
 
 Usage:
-    python cevt_to_events.py no_motion.cevt   --output-h5 no_motion.h5
-    python cevt_to_events.py with_motion.cevt --output-h5 with_motion.h5
+    # Current recorder (Metavision, .raw):
+    python raw_to_events.py no_motion.raw   --output no_motion.h5
+    python raw_to_events.py with_motion.raw --output with_motion.h5
+
+    # Legacy Arena recordings (.cevt, retired path -- see legacy/README.md):
+    python legacy/cevt_to_events.py no_motion.cevt   --output-h5 no_motion.h5
+    python legacy/cevt_to_events.py with_motion.cevt --output-h5 with_motion.h5
 
     python measure_event_rate.py no_motion.h5:idle with_motion.h5:motion
     python measure_event_rate.py no_motion.h5 with_motion.h5   # auto-labeled
@@ -23,8 +28,8 @@ import numpy as np
 
 
 def load_events_h5(path):
-    """Same schema/reader used across the project (cevt_to_events.py,
-    run_v2e.py, run_dvsvolt.py, read_evt3.py)."""
+    """Same schema/reader used across the project (raw_to_events.py,
+    run_v2e.py, run_dvsvolt.py, legacy/cevt_to_events.py)."""
     with h5py.File(str(path), "r") as hf:
         return {k: hf[k][:] for k in ("x", "y", "t", "p")}
 
@@ -40,8 +45,9 @@ def analyze(path: str, label: str, sensor_w: int, sensor_h: int, window_s: float
 
     duration_s = (t[-1] - t[0]) / 1e6 if n > 1 else 0.0
     if duration_s <= 0:
-        print(f"\n[{label}] {path}: duration is 0 — check --fps used in "
-              "cevt_to_events.py matched the real capture rate.")
+        print(f"\n[{label}] {path}: duration is 0 — if this came from "
+              "legacy/cevt_to_events.py, check --fps matched the real capture rate "
+              "(raw_to_events.py doesn't take --fps at all — real per-event t needs no guess).")
         return None
 
     rate_hz = n / duration_s

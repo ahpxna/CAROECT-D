@@ -27,12 +27,27 @@ paths:
 
 camera:
   # ── FRAME RATE (bẫy chết người — đọc kỹ) ────────────────────────
-  #   Free DaVinci cap timeline 60fps -> reinterpret Clip Attributes để
-  #   1 frame gốc = 1 TIFF. VERIFY sau export: #TIFF ≈ clip_seconds × 119.88.
-  #   Nếu ra ~1/4 -> DaVinci đã DROP frame -> làm lại.
+  #   Free DaVinci cap timeline ở fps_export -> để KHÔNG mất/nội suy frame,
+  #   RELABEL (không retime!) clip gốc qua Clip Attributes > Frame Rate:
+  #   đổi số ghi trong metadata từ fps_original xuống fps_export. Đây chỉ là
+  #   gắn nhãn lại — Resolve hiểu "clip này VỐN LÀ fps_export" nên giữ
+  #   NGUYÊN mọi frame gốc, chỉ là clip giờ chạy chậm lại ~(fps_original/
+  #   fps_export) lần trên timeline. Kéo vào timeline fps_export rồi export
+  #   TIFF bình thường -> ra ĐỦ số frame của clip gốc (không phải 1 frame/
+  #   frame timeline). Đừng dùng Retime/Optical Flow — đó là nội suy/drop
+  #   frame thật, phá đúng thứ mình đang tránh.
+  #   VERIFY sau export: #TIFF ≈ clip_seconds × fps_original (giây tính theo
+  #   ĐỒNG HỒ THẬT của cảnh quay, không phải theo timeline đã bị kéo dài).
+  #   Nếu ra ~1/N -> DaVinci đã DROP/nội suy frame thật -> làm lại.
+  #   ⚠ fps_original PHẢI là tốc độ CAMERA THẬT quay, không phải con số dùng
+  #   để relabel. Kiểm tra kỹ trong menu camera: một số máy phân biệt "120p"
+  #   (đúng 120.000) và "119.88p" (chuẩn NTSC-pulldown) — hai giá trị LỆCH
+  #   ~0.1%, đủ để timestamp trôi dần trên clip dài nếu ghi nhầm số. Xem
+  #   đúng số trong file thông tin clip gốc (MediaInfo/Clip Attributes),
+  #   đừng suy đoán từ tên preset.
   #   Mọi simulator nhận fps_original; KHÔNG BAO GIỜ đưa fps_export.
-  fps_original:   119.88
-  fps_export:     29.98
+  fps_original:   119.88   # ⚠ XÁC NHẬN LẠI đúng số camera thật dùng — có thể là 120.0 chính xác
+  fps_export:     29.97    # fps timeline DaVinci Free — chỉ dùng để relabel/export, KHÔNG dùng cho timestamp
   width:          1280      # IMX636 native (Triton2 EVS)
   height:         720
 

@@ -1,54 +1,90 @@
 #!/usr/bin/env python3
 """
-inspect_cevt.py — Read and sanity-check a CAROECT-D .cevt recording.
+inspect_evt3.py — Read and sanity-check a CAROECT-D .cevt recording, and home
+of decode_evt3() -- the shared word-level EVT3.0 decoder also imported by
+raw_to_events.py / raw_to_video.py for the CURRENT .raw pipeline.
+
+RENAMED from inspect_cevt.py. Two reasons, not just a cleanup:
+  1. Despite the CLI here being .cevt-specific (container inspection), the
+     decode_evt3() function is NOT .cevt-specific -- it decodes the standard
+     Prophesee EVT3.0 word format, which shows up both inside .cevt payloads
+     (legacy Arena path, see legacy/) AND directly in .raw files (current
+     Metavision path). raw_to_events.py's pure-python fallback backend and
+     raw_to_video.py both import decode_evt3 from this file. A name implying
+     "only relevant to the retired .cevt path" would be actively misleading
+     about a file the ACTIVE pipeline depends on.
+  2. The name "inspect.py" (dropping "cevt" entirely, as literally requested)
+     would shadow Python's own stdlib `inspect` module for every script run
+     from this directory -- Python puts a script's own directory at the front
+     of sys.path, so `import inspect` anywhere in the project would resolve
+     to this file instead of the standard library. run_v2e.py and
+     run_dvsvolt.py both call inspect.signature(...) as a core part of their
+     constructor-kwarg-filtering design; that would break silently/confusingly
+     project-wide. inspect_evt3.py keeps "inspect" as requested while naming
+     what's actually being inspected (EVT3.0 words) instead of the container
+     it happened to originally live inside.
 
 WHAT .cevt IS
 -------------
 NOT a video/image file — a custom binary container written by evs_recorder.cpp.
 Layout:
-    FileHeader                     (36 bytes, once)
+    FileHeader                     (once)
     RecordHeader + payload bytes   (repeated once per Arena buffer)
-    RecordHeader + payload bytes
     ...
 
-FileHeader (36 bytes, packed):
-    char[8]  magic          "CAROEVT1"
-    uint64   pixelFormat    (or payloadType if buffer wasn't image-typed)
+Two container versions exist and both are read here.
+
+CAROEVT2 FileHeader (72 bytes, packed)  — current:
+    char[8]  magic          "CAROEVT2"
+    uint64   pixelFormat    (or payloadType if the buffer wasn't image-typed)
     uint32   bitsPerPixel
     uint32   width
     uint32   height
-    uint64   reserved
+    uint32   recordHeaderSize
+    double   acquisitionFrameRateHz    <- read off the camera at record time
+    uint64   acquisitionFrameTimeUs    <- read off the camera at record time
+    uint64   hostUnixEpochNsAtStart
+    uint64   deviceTimestampAtStartNs
+    uint32   flags
+    uint32   reserved
 
-RecordHeader (24 bytes, packed):
+CAROEVT2 RecordHeader (40 bytes, packed):
     uint64   frameId
-    uint64   timestampNs    (buffer-level timestamp, NOT per-event)
-    uint64   payloadSize    (bytes immediately following this header)
+    uint64   deviceTimestampNs   (0 if the camera gave none)
+    uint64   hostRecvNs          (monotonic host arrival, always valid)
+    uint64   payloadSize
+    uint8    timestampSource     (0=none, 1=device, 2=host)
+    uint8[7] reserved
+
+CAROEVT1 (legacy): 36-byte FileHeader, 24-byte RecordHeader
+    (frameId, timestampNs, payloadSize). timestampNs was 0 in every record ever
+    produced on this camera, which is why V2 exists.
 
 WHAT THIS SCRIPT DOES
 ---------------------
 1. Parses the container losslessly (100% our own known format — safe).
-2. Prints a hex dump of the first payload so you can SEE the raw bytes.
-3. Attempts to decode the first payload as standard Prophesee EVT3.0
-   (the well-known public 16-bit-word vectorized format). This is the
-   camera's ONE confirmed real decode path (EventFormat=EVT3_0,
-   EventFormatSize=Bpe16/Bpe64 — XYPT was tried and confirmed NOT to exist
-   on this camera/firmware; see evs_recorder.cpp's top-of-file comment).
-   The script reports x/y/t ranges from the decode attempt; if x stays
-   < 1280 and y stays < 720 and timestamps trend upward, the hypothesis is
-   likely correct for this record. Some records (typically the very first)
-   may instead be a DENSE accumulated frame (baseline=128) rather than
-   sparse EVT3.0 words — analyze_as_dense_frame() checks that separately.
+2. Prints a hex dump of a chosen payload so you can SEE the raw bytes.
+3. Runs the DENSE ACCUMULATED FRAME check (analyze_as_dense_frame). This is
+   the confirmed real payload format for this camera: every payload observed
+   in the most recent full recording was exactly width*height bytes
+   (310/310 buffers at 921,600 bytes = 1280x720), baseline 128.
+4. Also attempts a standard Prophesee EVT3.0 word decode, as a FALSIFICATION
+   test rather than an expectation. AcquisitionAccumulationMode is
+   firmware-locked (IsAvailable=false), so the camera cannot currently emit
+   sparse events at all; if this decode ever starts producing sane in-bounds
+   x/y on a fresh recording, that is real news and worth chasing. Treat a
+   "plausible" verdict on a 921,600-byte dense frame as coincidence, not
+   evidence — random bytes decode to in-bounds coordinates surprisingly often.
 
-   NOTE: this script decodes ONE record in isolation, so it resets
-   time_low/time_high to 0 at the start of every call — it cannot tell you
-   whether TIME_LOW/TIME_HIGH is continuous across records. For that
-   diagnostic (needed before trusting t for calibration), use:
-     python cevt_to_events.py <file>.cevt --debug-time-continuity
+   NOTE: this decodes ONE record in isolation and resets time_low/time_high at
+   the start of every call, so it says nothing about time continuity ACROSS
+   records. For the real timestamp diagnostic, use:
+     python legacy/cevt_to_events.py <file>.cevt --debug-time-continuity
 
 Usage:
-    python inspect_cevt.py test.cevt
-    python inspect_cevt.py test.cevt --max-events 20     # print first N decoded events
-    python inspect_cevt.py test.cevt --no-decode         # skip EVT3.0 decode, just inspect container
+    python inspect_evt3.py test.cevt
+    python inspect_evt3.py test.cevt --max-events 20     # print first N decoded events
+    python inspect_evt3.py test.cevt --no-decode         # skip EVT3.0 decode, just inspect container
 """
 
 import argparse
@@ -56,49 +92,95 @@ import struct
 import sys
 from pathlib import Path
 
-FILE_HEADER_FMT = "<8sQIII Q"   # magic, pixelFormat, bitsPerPixel, width, height, reserved
-FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_FMT)
+# Container layouts. Kept byte-identical to evs_recorder.cpp's packed structs and
+# to cevt_to_events.py — if any of the three drift apart, every record in every
+# file misparses silently, so the sizes are asserted below rather than trusted.
+FILE_HEADER_V1_FMT = "<8sQIIIQ"        # magic, pixelFormat, bpp, w, h, reserved
+FILE_HEADER_V1_SIZE = struct.calcsize(FILE_HEADER_V1_FMT)
+RECORD_HEADER_V1_FMT = "<QQQ"          # frameId, timestampNs, payloadSize
+RECORD_HEADER_V1_SIZE = struct.calcsize(RECORD_HEADER_V1_FMT)
 
-RECORD_HEADER_FMT = "<QQQ"      # frameId, timestampNs, payloadSize
-RECORD_HEADER_SIZE = struct.calcsize(RECORD_HEADER_FMT)
+FILE_HEADER_V2_FMT = "<8sQIIIIdQQQII"
+FILE_HEADER_V2_SIZE = struct.calcsize(FILE_HEADER_V2_FMT)
+RECORD_HEADER_V2_FMT = "<QQQQB7x"      # frameId, deviceTs, hostRecv, size, source, pad
+RECORD_HEADER_V2_SIZE = struct.calcsize(RECORD_HEADER_V2_FMT)
+
+assert (FILE_HEADER_V1_SIZE, RECORD_HEADER_V1_SIZE) == (36, 24), "V1 layout drifted"
+assert (FILE_HEADER_V2_SIZE, RECORD_HEADER_V2_SIZE) == (72, 40), "V2 layout drifted"
+
+TS_SOURCE_NAME = {0: "none", 1: "device", 2: "host"}
 
 
 def read_file_header(f):
-    raw = f.read(FILE_HEADER_SIZE)
-    if len(raw) < FILE_HEADER_SIZE:
-        raise ValueError(f"File too short for FileHeader (need {FILE_HEADER_SIZE} bytes, "
-                         f"got {len(raw)}). Is this really a .cevt file?")
-    magic, pixel_format, bpp, width, height, reserved = struct.unpack(FILE_HEADER_FMT, raw)
-    magic_str = magic.split(b"\x00")[0].decode("ascii", errors="replace")
+    peek = f.read(8)
+    f.seek(0)
+    if len(peek) < 8:
+        raise ValueError("File too short to contain a magic number. Is this really a .cevt file?")
+
+    if peek == b"CAROEVT2":
+        raw = f.read(FILE_HEADER_V2_SIZE)
+        if len(raw) < FILE_HEADER_V2_SIZE:
+            raise ValueError("File truncated inside the CAROEVT2 FileHeader.")
+        (_m, pf, bpp, w, h, rec_size, fps_hz, frame_us,
+         host_epoch, dev_ts0, flags, _r) = struct.unpack(FILE_HEADER_V2_FMT, raw)
+        if rec_size != RECORD_HEADER_V2_SIZE:
+            raise ValueError(
+                f"File declares recordHeaderSize={rec_size} but this script understands "
+                f"{RECORD_HEADER_V2_SIZE}. Written by a newer recorder — update this script.")
+        return {
+            "version": 2, "magic": "CAROEVT2",
+            "pixel_format_or_payload_type": pf, "bits_per_pixel": bpp,
+            "width": w, "height": h,
+            "record_header_size": rec_size, "record_header_fmt": RECORD_HEADER_V2_FMT,
+            "frame_rate_hz": fps_hz, "frame_time_us": frame_us,
+            "host_epoch_ns": host_epoch, "device_ts_at_start_ns": dev_ts0, "flags": flags,
+        }
+
+    magic_str = peek.split(b"\x00")[0].decode("ascii", errors="replace")
     if magic_str != "CAROEVT1":
-        print(f"  [warning] magic = {magic_str!r}, expected 'CAROEVT1' — "
+        print(f"  [warning] magic = {magic_str!r}, expected 'CAROEVT1' or 'CAROEVT2' — "
               "file may be corrupt or not written by evs_recorder.cpp.")
+    raw = f.read(FILE_HEADER_V1_SIZE)
+    if len(raw) < FILE_HEADER_V1_SIZE:
+        raise ValueError(f"File too short for FileHeader (need {FILE_HEADER_V1_SIZE} bytes, "
+                         f"got {len(raw)}). Is this really a .cevt file?")
+    _m, pixel_format, bpp, width, height, _reserved = struct.unpack(FILE_HEADER_V1_FMT, raw)
     return {
-        "magic": magic_str,
-        "pixel_format_or_payload_type": pixel_format,
-        "bits_per_pixel": bpp,
-        "width": width,
-        "height": height,
+        "version": 1, "magic": magic_str,
+        "pixel_format_or_payload_type": pixel_format, "bits_per_pixel": bpp,
+        "width": width, "height": height,
+        "record_header_size": RECORD_HEADER_V1_SIZE, "record_header_fmt": RECORD_HEADER_V1_FMT,
+        "frame_rate_hz": 0.0, "frame_time_us": 0,
+        "host_epoch_ns": 0, "device_ts_at_start_ns": 0, "flags": 0,
     }
 
 
-def iter_records(f):
-    """Yields (frame_id, timestamp_ns, payload_bytes) for every record in the file."""
+def iter_records(f, header):
+    """Yields (frame_id, device_ts_ns, host_recv_ns, ts_source, payload) per record."""
+    size = header["record_header_size"]
+    fmt = header["record_header_fmt"]
+    v2 = header["version"] >= 2
+
     while True:
-        raw = f.read(RECORD_HEADER_SIZE)
+        raw = f.read(size)
         if len(raw) == 0:
             return  # clean EOF
-        if len(raw) < RECORD_HEADER_SIZE:
+        if len(raw) < size:
             print(f"  [warning] truncated RecordHeader at end of file "
-                  f"({len(raw)} of {RECORD_HEADER_SIZE} bytes) — recording likely cut off mid-write.")
+                  f"({len(raw)} of {size} bytes) — recording likely cut off mid-write.")
             return
-        frame_id, timestamp_ns, payload_size = struct.unpack(RECORD_HEADER_FMT, raw)
+        if v2:
+            frame_id, dev_ns, host_ns, payload_size, ts_source = struct.unpack(fmt, raw)
+        else:
+            frame_id, dev_ns, payload_size = struct.unpack(fmt, raw)
+            host_ns = 0
+            ts_source = 1 if dev_ns > 0 else 0
         payload = f.read(payload_size)
         if len(payload) < payload_size:
             print(f"  [warning] truncated payload for frame {frame_id} "
                   f"(expected {payload_size}, got {len(payload)}) — recording likely cut off mid-write.")
             return
-        yield frame_id, timestamp_ns, payload
+        yield frame_id, dev_ns, host_ns, ts_source, payload
 
 
 def hex_dump(data: bytes, n: int = 64):
@@ -291,30 +373,58 @@ def main():
     with open(path, "rb") as f:
         header = read_file_header(f)
         print("FileHeader:")
-        print(f"  magic                       = {header['magic']!r}")
+        print(f"  magic                       = {header['magic']!r}  (container v{header['version']})")
         print(f"  pixelFormat / payloadType   = {header['pixel_format_or_payload_type']} "
               f"(0x{header['pixel_format_or_payload_type']:x})")
         print(f"  bitsPerPixel                = {header['bits_per_pixel']}")
         print(f"  width x height              = {header['width']} x {header['height']}")
+        if header["version"] >= 2:
+            print(f"  AcquisitionFrameRate        = {header['frame_rate_hz']} Hz")
+            print(f"  AcquisitionFrameTime        = {header['frame_time_us']} us")
+            print(f"  device Timestamp at start   = {header['device_ts_at_start_ns']} ns")
+            print(f"  flags                       = 0b{header['flags']:03b} "
+                  f"(bit0=TimestampReset ok, bit1=device ts available, bit2=frame rate known)")
+        else:
+            print("  [note] CAROEVT1 file: no host timestamps, no camera frame rate, no")
+            print("         per-record timestamp source. Re-record with the current")
+            print("         evs_recorder to get measured window times.")
         print()
 
         total_records = 0
         total_payload_bytes = 0
-        min_ts, max_ts = None, None
-        first_payload = None
-        first_frame_id = None
+        selected_payload = None
+        selected_frame_id = None
         first_n_sizes = []
+        size_histogram = {}
+        ts_source_counts = {}
+        dev_min = dev_max = None
+        host_min = host_max = None
+        prev_frame_id = None
+        frame_id_gaps = 0
 
-        for frame_id, timestamp_ns, payload in iter_records(f):
+        for frame_id, dev_ns, host_ns, ts_source, payload in iter_records(f, header):
             total_records += 1
             total_payload_bytes += len(payload)
-            if min_ts is None or timestamp_ns < min_ts:
-                min_ts = timestamp_ns
-            if max_ts is None or timestamp_ns > max_ts:
-                max_ts = timestamp_ns
+            size_histogram[len(payload)] = size_histogram.get(len(payload), 0) + 1
+            ts_source_counts[ts_source] = ts_source_counts.get(ts_source, 0) + 1
+
+            # Only track ranges over records that actually carry that clock;
+            # folding the 0s from unstamped records into the min would report a
+            # bogus multi-second span.
+            if dev_ns:
+                dev_min = dev_ns if dev_min is None else min(dev_min, dev_ns)
+                dev_max = dev_ns if dev_max is None else max(dev_max, dev_ns)
+            if host_ns:
+                host_min = host_ns if host_min is None else min(host_min, host_ns)
+                host_max = host_ns if host_max is None else max(host_max, host_ns)
+
+            if prev_frame_id is not None and frame_id > prev_frame_id + 1:
+                frame_id_gaps += 1
+            prev_frame_id = frame_id
+
             if total_records - 1 == args.record_index:
-                first_payload = payload
-                first_frame_id = frame_id
+                selected_payload = payload
+                selected_frame_id = frame_id
             if len(first_n_sizes) < 10:
                 first_n_sizes.append(len(payload))
 
@@ -323,33 +433,53 @@ def main():
         print(f"  total payload bytes            = {total_payload_bytes:,}")
         if total_records > 0:
             print(f"  avg payload bytes/record        = {total_payload_bytes / total_records:.1f}")
-        if min_ts is not None:
-            print(f"  buffer timestamp range (ns)     = {min_ts} .. {max_ts}  "
-                  f"(span {(max_ts - min_ts) / 1e9:.3f} s)")
         print(f"  payload sizes of first {len(first_n_sizes)} records = {first_n_sizes}")
+
+        # A size histogram beats "avg bytes/record" for spotting the failure that
+        # actually happens here: a handful of correct-size records mixed with a
+        # majority of truncated ones. The average alone hides that completely.
+        expected = args.sensor_width * args.sensor_height
+        print(f"  distinct payload sizes          = {len(size_histogram)}")
+        for sz, count in sorted(size_histogram.items(), key=lambda kv: -kv[1])[:5]:
+            tag = "  <-- matches W*H (dense frame)" if sz == expected else ""
+            print(f"      {sz:>10,} bytes x {count:>5} record(s){tag}")
+
+        print(f"  timestamp sources               = "
+              f"{ {TS_SOURCE_NAME.get(k, k): v for k, v in ts_source_counts.items()} }")
+        if dev_min is not None:
+            print(f"  device timestamp range (ns)     = {dev_min} .. {dev_max}  "
+                  f"(span {(dev_max - dev_min) / 1e9:.3f} s)")
+        else:
+            print("  device timestamp range          = none (no record carried a device clock)")
+        if host_min is not None:
+            print(f"  host recv range (ns)            = {host_min} .. {host_max}  "
+                  f"(span {(host_max - host_min) / 1e9:.3f} s)")
+        if frame_id_gaps:
+            print(f"  frame_id gaps                   = {frame_id_gaps}  "
+                  f"(buffers lost between records — real time gaps, not reordering)")
         print()
 
-        if first_payload is None:
+        if selected_payload is None:
             print(f"Record index {args.record_index} not found (only {total_records} "
                   "records in file) — file has only a FileHeader, or index out of range.")
             return
 
-        print(f"Selected record (index {args.record_index}): frameId={first_frame_id}, "
-              f"payload size={len(first_payload)} bytes")
+        print(f"Selected record (index {args.record_index}): frameId={selected_frame_id}, "
+              f"payload size={len(selected_payload)} bytes")
         print(f"First 64 bytes of this payload (hex + ascii):")
-        print(hex_dump(first_payload, 64))
+        print(hex_dump(selected_payload, 64))
         print()
 
-        analyze_as_dense_frame(first_payload, args.sensor_width, args.sensor_height, args.record_index)
+        analyze_as_dense_frame(selected_payload, args.sensor_width, args.sensor_height, args.record_index)
         print()
 
         if args.no_decode:
             return
 
         print(f"Attempting EVT3.0 decode of record {args.record_index} payload (hypothesis test)...")
-        events = decode_evt3(first_payload, max_events=None)
-        print(f"  decoded {len(events)} CD events from {len(first_payload)} bytes "
-              f"({len(first_payload) / 2:.0f} words)")
+        events = decode_evt3(selected_payload, max_events=None)
+        print(f"  decoded {len(events)} CD events from {len(selected_payload)} bytes "
+              f"({len(selected_payload) / 2:.0f} words)")
 
         if not events:
             print("  No events decoded — either the payload truly has none, or the "

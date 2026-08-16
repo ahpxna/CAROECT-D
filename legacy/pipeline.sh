@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+#======================================================================
+# RETIRED - see legacy/README.md. NOT used by run_pipeline.sh.
+#
+# Old wrapper that stopped at events.h5 and still referenced the removed XYPT
+# flags. Superseded by run_pipeline.sh.
+#======================================================================
+
 # Backward-compatible wrapper for the full CAROECT-D orchestrator.
 set -euo pipefail
 

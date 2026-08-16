@@ -1,3 +1,16 @@
 __pycache__/
 .DS_Store
 *.pdf
+
+# Recording + conversion artefacts. These are data, not source, and some are
+# large (a 60 s dense recording is ~1.6 GB at 921600 B/frame).
+*.cevt
+*.raw.evt3
+*.h5
+*.mp4
+record_*_preview.png
+_calib_work/
+data/
+runs/
+evs_recorder          # compiled binary from build_linux.sh
+config.yaml.bak

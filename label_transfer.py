@@ -48,10 +48,26 @@ GIỚI HẠN — không tự động giải quyết
 - --max-gap-frames chặn nội suy xuyên qua khoảng track bị mất quá lâu (occlusion
   dài) — mặc định 5 frame (~42ms @119.88fps); vượt ngưỡng này track coi như
   "mất dấu", 2 đoạn trước/sau KHÔNG nối bằng đường thẳng.
+- CLOCK ALIGNMENT với event THẬT: tracks.json's t=0 là mốc bắt đầu clip RGB;
+  events.h5's t (khi từ raw_to_events.py / legacy/cevt_to_events.py, tức 2
+  camera vật lý riêng) là đồng hồ CỦA RIÊNG camera event, không có quan hệ nào
+  đảm bảo với t=0 của RGB. File này GIẢ ĐỊNH track frame_idx=0 khớp với
+  events['t'].min() + --time-offset-us (mặc định offset=0 -- một giả định,
+  không phải số đo). Sai giả định này -> mọi event lệch hẳn ra ngoài range
+  track -> gán nhãn background 100% một cách ÂM THẦM, không exception nào cả.
+  Luôn chạy --stats lần đầu trên data thật và kiểm tra tỉ lệ foreground có hợp
+  lý với cảnh quay không. (Không áp dụng cho events.h5 từ run_v2e.py/
+  run_dvsvolt.py -- t ở đó sinh trực tiếp từ chính frame_idx của track nên
+  luôn khớp đúng theo construction, không cần offset.)
 
 Usage:
   python label_transfer.py --tracks tracks.json --events events.h5 \
       --window-us 8342 --max-gap-frames 5 --output windows.json --stats
+
+  # Event THẬT (2 camera riêng) -- luôn kiểm tra --stats trước khi tin windows.json,
+  # và set --time-offset-us nếu biết độ lệch trigger giữa 2 camera:
+  python label_transfer.py --tracks tracks.json --events events_real.h5 \
+      --output windows.json --stats --time-offset-us 0
 
   # Xuất thêm nhãn per-event thật (để visualize / debug), KHÔNG cần cho train:
   python label_transfer.py --tracks tracks.json --events events.h5 \
@@ -93,29 +109,43 @@ def load_tracks(path: str) -> dict:
     return payload["fps"], payload["width"], payload["height"], tracks
 
 
-def load_events_h5(path: str) -> dict:
-    """Same schema as run_v2e.py / run_dvsvolt.py / cevt_to_events.py output."""
+def load_events_h5(path: str):
+    """Same schema as run_v2e.py / run_dvsvolt.py / raw_to_events.py output.
+    Returns (data, attrs) -- attrs is used by main() to tell simulated events
+    (attrs['simulator'] present, written by run_v2e.py/run_dvsvolt.py) apart
+    from real recorded events (no such key), which matters for the
+    --time-offset-us clock-alignment warning below."""
     with h5py.File(str(path), "r") as hf:
-        return {k: hf[k][:] for k in ("x", "y", "t", "p")}
+        data = {k: hf[k][:] for k in ("x", "y", "t", "p")}
+        attrs = dict(hf.attrs)
+    return data, attrs
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  N2 · NỘI SUY TUYẾN TÍNH — chính là công thức α ở module docstring
 # ══════════════════════════════════════════════════════════════════════════
 
-def interpolate_box(track: dict, t_query: float, max_gap_us: float):
-    """Trả về (cx,cy,w,h) nội suy tại t_query, hoặc None nếu:
-      - t_query nằm ngoài [t_first, t_last] của track (không extrapolate), hoặc
-      - t_query rơi vào 1 khoảng gap giữa 2 quan sát liên tiếp lớn hơn max_gap_us
-        (occlusion dài -> không nối 2 đoạn track bằng 1 đường thẳng giả)."""
-    t = track["t"]
-    if len(t) < 1 or t_query < t[0] or t_query > t[-1]:
-        return None
-    idx = bisect.bisect_right(t, t_query) - 1
-    idx = min(max(idx, 0), len(t) - 2) if len(t) > 1 else 0
-    if len(t) == 1:
-        return None  # 1 điểm duy nhất -> không đủ để nội suy khoảng thời gian nào
+def _find_bracket(t: np.ndarray, t_query: float, max_gap_us: float):
+    """MỘT nơi duy nhất tìm cặp bracket [idx, idx+1] bao quanh t_query + alpha.
 
+    Trước đây interpolate_box() và _active_obs_index() (mask) mỗi hàm tự có
+    1 bản logic bracket riêng gần-giống-nhưng-không-giống-hệt — box có nhánh
+    fallback np.searchsorted khi bisect_right không bao đúng t_query (hay gặp
+    khi 2 observation trùng timestamp), mask thì không có nhánh đó -> có ca
+    box nội suy được nhưng mask lại fail, và tệ hơn nữa là NẾU cả hai đều
+    thành công thì cũng không có gì đảm bảo 2 alpha tính ra giống nhau. Gộp về
+    đây để box và mask LUÔN dùng chung đúng 1 alpha cho cùng 1 t_query.
+
+    Trả về (idx, alpha) hoặc (None, None) nếu:
+      - t_query nằm ngoài [t_first, t_last] của track (không extrapolate), hoặc
+      - track chỉ có 1 quan sát (không đủ để định nghĩa 1 khoảng), hoặc
+      - khoảng [t[idx], t[idx+1]] bao t_query lớn hơn max_gap_us (occlusion
+        dài -> không nối 2 đoạn track bằng 1 đường thẳng/mask giả)."""
+    if len(t) < 2 or t_query < t[0] or t_query > t[-1]:
+        return None, None
+
+    idx = bisect.bisect_right(t, t_query) - 1
+    idx = min(max(idx, 0), len(t) - 2)
     t_i, t_ip1 = t[idx], t[idx + 1]
     if t_query < t_i or t_query > t_ip1:
         # t_query nằm giữa 2 khoảng bisect không trực tiếp bao — quét lại tuyến tính
@@ -124,12 +154,21 @@ def interpolate_box(track: dict, t_query: float, max_gap_us: float):
         idx = min(max(idx, 0), len(t) - 2)
         t_i, t_ip1 = t[idx], t[idx + 1]
         if not (t_i <= t_query <= t_ip1):
-            return None
+            return None, None
 
     if (t_ip1 - t_i) > max_gap_us:
-        return None  # gap quá lớn -> track coi như mất dấu trong khoảng này
+        return None, None  # gap quá lớn -> track coi như mất dấu trong khoảng này
 
     alpha = 0.0 if t_ip1 == t_i else (t_query - t_i) / (t_ip1 - t_i)
+    return idx, alpha
+
+
+def interpolate_box(track: dict, t_query: float, max_gap_us: float):
+    """Trả về (cx,cy,w,h) nội suy tại t_query theo alpha từ _find_bracket(),
+    hoặc None nếu track không bao t_query / gap quá lớn (xem _find_bracket)."""
+    idx, alpha = _find_bracket(track["t"], t_query, max_gap_us)
+    if idx is None:
+        return None
     cx = (1 - alpha) * track["cx"][idx] + alpha * track["cx"][idx + 1]
     cy = (1 - alpha) * track["cy"][idx] + alpha * track["cy"][idx + 1]
     w = (1 - alpha) * track["w"][idx] + alpha * track["w"][idx + 1]
@@ -177,10 +216,22 @@ def label_windows(tracks: dict, windows: list, max_gap_us: float,
             if clipped is None:
                 continue  # tâm box đã ra khỏi khung hình -> bỏ qua window này
             cx, cy, w, h = clipped
-            obs_idx = _active_obs_index(track, tc, max_gap_us)
+            # windows.json stores ONE mask_path per box (COCO/YOLO export consumes it
+            # as a single PNG, not a blend) -- so here we pick whichever of the two
+            # bracketing observations is GEOMETRICALLY CLOSER to the window center,
+            # using the same (idx, alpha) bracket the box interpolation just used
+            # (not the old always-floor _active_obs_index, which silently froze the
+            # mask at the earlier frame even when alpha was e.g. 0.99). Real linear
+            # blending of both masks happens at the per-event level instead, in
+            # _mask_contains() below via assign_events_to_tracks() -- that is the
+            # granularity where "blend of two discretely-observed masks" in the
+            # paper actually applies (per exact event timestamp t_k), not here.
+            idx, alpha = _active_obs_bracket(track, tc, max_gap_us)
             mask_path = None
-            if obs_idx is not None and obs_idx < len(track["mask_path"]):
-                mask_path = track["mask_path"][obs_idx]
+            if idx is not None:
+                chosen_idx = idx if alpha < 0.5 else idx + 1
+                if chosen_idx < len(track["mask_path"]):
+                    mask_path = track["mask_path"][chosen_idx]
             boxes.append(dict(track_id=track_id, class_id=track["class_id"],
                               cx=cx, cy=cy, w=w, h=h, mask_path=mask_path))
         out.append(dict(t_start_us=t0, t_end_us=t1, t_center_us=tc, boxes=boxes))
@@ -191,36 +242,61 @@ def label_windows(tracks: dict, windows: list, max_gap_us: float,
 #  N4 · (TÙY CHỌN) PER-EVENT LABEL — công thức L(e_k) đầy đủ + occlusion stats
 # ══════════════════════════════════════════════════════════════════════════
 
-def _mask_contains(track: dict, obs_idx: int, x_px: int, y_px: int, mask_cache: dict) -> bool | None:
+def _load_mask(track: dict, obs_idx: int, mask_cache: dict):
+    """Load 1 mask PNG (grayscale, >0 = foreground) tại obs_idx, cache theo path.
+    Trả về mảng bool 2D hoặc None nếu thiếu mask_path / đọc file lỗi."""
     rel = track["mask_path"][obs_idx] if obs_idx < len(track["mask_path"]) else None
     if not rel:
         return None
-    path = track["base_dir"] / rel
-    key = str(path)
+    key = str(track["base_dir"] / rel)
     if key not in mask_cache:
         import cv2
         mask = cv2.imread(key, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            mask_cache[key] = None
-        else:
-            mask_cache[key] = mask > 0
-    mask = mask_cache[key]
-    if mask is None or y_px < 0 or x_px < 0 or y_px >= mask.shape[0] or x_px >= mask.shape[1]:
-        return None
-    return bool(mask[y_px, x_px])
+        mask_cache[key] = None if mask is None else (mask > 0)
+    return mask_cache[key]
 
 
-def _active_obs_index(track: dict, t_query: float, max_gap_us: float):
-    t = track["t"]
-    if len(t) < 2 or t_query < t[0] or t_query > t[-1]:
+def _mask_contains(track: dict, idx: int, alpha: float, x_px: int, y_px: int,
+                    mask_cache: dict, thresh: float = 0.5) -> bool | None:
+    """Blend TUYẾN TÍNH mask[idx] và mask[idx+1] theo alpha, đúng câu paper
+    ("linear blend of two discretely-observed masks") — thay vì trước đây
+    chỉ lấy nguyên mask[idx] (nearest-left), không hề đụng tới idx+1.
+    idx, alpha PHẢI đến từ cùng _find_bracket() dùng cho box (xem
+    _active_obs_bracket) để box và mask luôn khớp nhau tại đúng 1 t_query.
+
+    Trả về None nếu KHÔNG mask nào đọc được (giữ nguyên hành vi cũ: caller
+    fallback về box-only khi None). Nếu chỉ 1 trong 2 mask đọc được, dùng
+    nguyên mask đó (không coi phần thiếu là 0 — tránh kéo blended value
+    xuống thấp giả tạo do lỗi đọc file, không phải do object thật sự
+    biến mất khỏi mask)."""
+    m_lo = _load_mask(track, idx, mask_cache)
+    m_hi = _load_mask(track, idx + 1, mask_cache)
+    if m_lo is None and m_hi is None:
         return None
-    idx = bisect.bisect_right(t, t_query) - 1
-    idx = min(max(idx, 0), len(t) - 2)
-    if (t[idx + 1] - t[idx]) > max_gap_us:
+
+    def _val(mask):
+        if (mask is None or y_px < 0 or x_px < 0
+                or y_px >= mask.shape[0] or x_px >= mask.shape[1]):
+            return None
+        return float(mask[y_px, x_px])
+
+    v_lo, v_hi = _val(m_lo), _val(m_hi)
+    if v_lo is None and v_hi is None:
         return None
-    if not (t[idx] <= t_query <= t[idx + 1]):
-        return None
-    return idx
+    if v_lo is None:
+        return v_hi > thresh
+    if v_hi is None:
+        return v_lo > thresh
+    blended = (1.0 - alpha) * v_lo + alpha * v_hi
+    return blended > thresh
+
+
+def _active_obs_bracket(track: dict, t_query: float, max_gap_us: float):
+    """Alias mỏng qua _find_bracket() — mask giờ dùng CHUNG bracket-finder với
+    box (interpolate_box), thay vì có bản logic riêng như _active_obs_index()
+    cũ (thiếu nhánh fallback np.searchsorted mà box có -> có ca box nội suy
+    được nhưng mask lại fail, xem comment trong _find_bracket)."""
+    return _find_bracket(track["t"], t_query, max_gap_us)
 
 
 def assign_events_to_tracks(events: dict, tracks: dict, max_gap_us: float,
@@ -270,9 +346,14 @@ def assign_events_to_tracks(events: dict, tracks: dict, max_gap_us: float,
                 continue
             in_object = True
             if use_masks:
-                obs_idx = _active_obs_index(tracks[tid], float(tk), max_gap_us)
-                if obs_idx is not None:
-                    in_mask = _mask_contains(tracks[tid], obs_idx, int(round(x[k])), int(round(y[k])), mask_cache)
+                # THIS is the per-event granularity the paper's "linear blend of two
+                # discretely-observed masks" describes: idx/alpha come from the same
+                # bracket-finder used for the box, so mask and box are evaluated at
+                # the exact same t_k, and _mask_contains() blends mask[idx] and
+                # mask[idx+1] by alpha instead of freezing at the earlier frame.
+                idx, alpha = _active_obs_bracket(tracks[tid], float(tk), max_gap_us)
+                if idx is not None:
+                    in_mask = _mask_contains(tracks[tid], idx, alpha, int(round(x[k])), int(round(y[k])), mask_cache)
                     if in_mask is not None:
                         in_object = in_mask
             if in_object:
@@ -313,13 +394,60 @@ def main():
                          "file h5 này — dùng để visualize/debug độ chính xác pixel-level")
     ap.add_argument("--no-masks", action="store_true",
                     help="Không dùng mask PNG trong tracks.json; fallback về box-only.")
+    ap.add_argument("--time-offset-us", type=float, default=0.0,
+                    help="Offset (µs) cộng vào events['t'].min() để định nghĩa mốc mà "
+                         "track frame_idx=0 (t=0 trong tracks.json) THỰC SỰ xảy ra trên "
+                         "đồng hồ của camera event — CÙNG QUY ƯỚC với calibrate_simulator.py's "
+                         "--time-offset-us. Mặc định 0.0 nghĩa là 'frame 0 khớp đúng event "
+                         "đầu tiên', chỉ ĐÚNG khi 2 camera trigger cùng lúc thật sự (hoặc khi "
+                         "events.h5 tới từ run_v2e.py/run_dvsvolt.py, vốn sinh t từ CHÍNH "
+                         "frame_idx của track nên khớp tuyệt đối theo construction). Với event "
+                         "THẬT (raw_to_events.py / legacy/cevt_to_events.py) đây là 2 camera "
+                         "vật lý riêng, 2 đồng hồ riêng — offset=0 là GIẢ ĐỊNH, không phải đo "
+                         "đạc; xem cảnh báo in ra khi chạy nếu chưa set cờ này.")
     args = ap.parse_args()
 
     fps, W, H, tracks = load_tracks(args.tracks)
-    events = load_events_h5(args.events)
+    events, events_attrs = load_events_h5(args.events)
     n_events = len(events["t"])
     if n_events == 0:
         raise ValueError(f"{args.events} có 0 event — không có gì để gán nhãn")
+
+    # ── CLOCK ALIGNMENT ──────────────────────────────────────────────────
+    # tracks.json's t is 0-based (frame_idx * 1e6/fps, relative to the RGB
+    # clip's own start). events.h5's t is either (a) 0-based too, BY
+    # CONSTRUCTION, when it came from run_v2e.py/run_dvsvolt.py -- those
+    # scripts derive every event's t directly from the same TIFF frame
+    # index the track was built from, so no alignment is needed or possible
+    # to get wrong -- or (b) an independent physical event camera's own
+    # clock (raw_to_events.py: real sensor µs; legacy/cevt_to_events.py:
+    # device/host buffer time), which has NO guaranteed relationship to the
+    # RGB camera's t=0 whatsoever. Shifting tracks['t'] by
+    # (events['t'].min() + --time-offset-us) is the only place this
+    # assumption enters the file; every comparison below (_find_bracket,
+    # build_windows) works in events.h5's own absolute time frame after
+    # this point.
+    is_simulated = "simulator" in events_attrs
+    frame0_event_t = float(events["t"].min()) + args.time_offset_us
+    if not is_simulated:
+        tag = "[warning]" if args.time_offset_us == 0.0 else "[info]"
+        print(f"\n{tag} events.h5 có nguồn THẬT (không có attrs['simulator']) — 2 camera vật "
+              f"lý riêng, 2 đồng hồ riêng. Đang giả định track frame_idx=0 xảy ra tại "
+              f"events['t'].min() + --time-offset-us = {frame0_event_t:.0f} µs "
+              f"(--time-offset-us={args.time_offset_us:.0f}).")
+        if args.time_offset_us == 0.0:
+            print("  Đây là GIẢ ĐỊNH mặc định (offset=0), KHÔNG phải số đo — nếu 2 camera "
+                  "không trigger đồng thời thật sự (network/USB/GigE latency, jitter phần "
+                  "cứng khi start), MỌI event sẽ bị gán sai nhãn (thường là tất cả rơi ra "
+                  "ngoài [t_first, t_last] của track -> background 100%, không có warning "
+                  "nào khác ngoài warning này). Cách kiểm tra nhanh: chạy với --stats, nếu "
+                  "'event background' ~100% mà cảnh biết chắc có object suốt clip, đó là "
+                  "dấu hiệu offset sai, không phải model tệ. Đo offset thật cần 1 sự kiện "
+                  "đồng bộ nhìn thấy được ở CẢ HAI luồng (vd đèn flash/clapperboard xuất "
+                  "hiện trong cả TIFF lẫn event) rồi trừ chênh lệch t giữa 2 luồng cho sự "
+                  "kiện đó — project chưa có script tự động làm việc này.")
+    for track in tracks.values():
+        track["t"] = track["t"] + frame0_event_t
 
     t_origin_us = float(events["t"].min())
     duration_us = float(events["t"].max() - events["t"].min())

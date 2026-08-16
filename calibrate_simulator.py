@@ -14,9 +14,12 @@ không phải sửa code model — nên không tốn thêm 1 paper con nào đ�
 
 INPUT CẦN CÓ TRƯỚC
 -------------------
-  1. events_real.h5   — từ cevt_to_events.py, ghi bằng evs_recorder.cpp, quay CÙNG
-                         cảnh CÙNG lúc với clip TIFF ở mục 2 (rig Nikon+Triton2 gắn
-                         cứng, side-by-side — điều kiện bắt buộc để so sánh có nghĩa).
+  1. events_real.h5   — từ raw_to_events.py (recorder hiện tại, evs_recorder.cpp
+                         qua Metavision, .raw, SPARSE, t thật µs — status="precise")
+                         hoặc, cho data cũ, legacy/cevt_to_events.py (Arena, .cevt,
+                         DENSE, status="device_buffer"/"host_arrival"/"synthesized").
+                         Quay CÙNG cảnh CÙNG lúc với clip TIFF ở mục 2 (rig gắn cứng,
+                         side-by-side — điều kiện bắt buộc để so sánh có nghĩa).
   2. 1 thư mục TIFF    — output nhánh Y (16-bit linear) của preprocess.py, cùng cảnh
                          cùng lúc với (1).
 
@@ -35,19 +38,41 @@ DVS-Voltmeter nói k1 nhạy nhất nên chỉnh trước, rồi k2; v2e thì po
   In bảng candidate -> sai số, đề xuất giá trị tốt nhất. KHÔNG tự ghi đè config.yaml —
   phải chạy lại với --apply mới ghi (có backup .bak trước khi ghi).
 
-GIỚI HẠN ĐÃ BIẾT — ĐỌC TRƯỚC KHI TIN KẾT QUẢ
-----------------------------------------------
-Nếu events_real.h5 có attrs["decode_method_counts"] cho thấy phần lớn record là
-"dense" (không phải "xypt" — xem cevt_to_events.py), thì timestamp trong file đó là
-BỊA từ frame_index, không phải thời điểm event thật. Trong trường hợp đó:
-  - Metric RATE và ON/OFF SPLIT (dùng ở đây) vẫn tin được — chỉ cần đếm event.
-  - Không tin được PHÂN PHỐI khoảng-cách-thời-gian (τ) giữa các event — nên script
-    này CHỈ tune nhóm tham số ảnh hưởng SỐ LƯỢNG event: k1,k2,k4,k5 (DVS-Voltmeter)
-    hoặc pos_thres,neg_thres (v2e). KHÔNG dùng script này để tune k3,k6 (nhóm
-    noise/jitter thời gian) — cần XYPT thật (bật mặc định ở evs_recorder từ giờ).
-Nếu decode_method_counts cho thấy "xypt" chiếm đa số, script in thêm so sánh phân
-phối inter-event-interval (Wasserstein 1D, công thức min-cost 1 chiều — xem PDF scope
-mục Q2) để bạn có căn cứ chỉnh k3/k6 bằng tay (chưa tự động hoá bước đó).
+GIỚI HẠN THEO NGUỒN DATA — ĐỌC TRƯỚC KHI TIN KẾT QUẢ
+------------------------------------------------------
+ĐÃ THAY ĐỔI so với bản trước: recorder hiện tại (evs_recorder.cpp qua Metavision)
+KHÔNG còn giới hạn dense-frame-only nữa — nó xuất SPARSE (x,y,p,t) với timestamp
+thật cấp µs cho từng event (xem raw_to_events.py). TIMING_ONLY (k3,k6/sigma_thres/
+cutoff_hz/leak_rate_hz/shot_noise_rate_hz) giờ CALIBRATE ĐƯỢC nếu events_real.h5
+tới từ raw_to_events.py (status="precise", t_quantization_us=0).
+
+Giới hạn cũ CHỈ còn áp dụng cho data quay bằng recorder Arena SDK đã RETIRED
+(legacy/evs_recorder.cpp -> .cevt -> legacy/cevt_to_events.py), vì camera qua
+Arena chỉ xuất được dense accumulated frame (AcquisitionAccumulationMode bị
+khoá firmware, IsAvailable=false — xem comment đầu legacy/evs_recorder.cpp):
+
+  - Mọi event trong cùng 1 accumulation window dùng CHUNG 1 timestamp. Phân phối
+    khoảng-cách-thời-gian (τ) giữa các event KHÔNG TỒN TẠI trong data DENSE này,
+    dù clock có thật đến đâu. Vì vậy KHÔNG tune được TIMING_ONLY trên data .cevt.
+  - Metric RATE và ON/OFF SPLIT vẫn tin được trên cả 2 nguồn (chỉ cần đếm event),
+    nên nhóm RATE_SAFE (k1,k2,k4,k5 / pos_thres,neg_thres,refractory_period) luôn
+    calibrate bình thường bất kể events_real.h5 từ recorder nào.
+
+check_timestamp_precision() bên dưới đọc đúng 3 attribute này thay vì tin lời
+người dùng — cả raw_to_events.py lẫn legacy/cevt_to_events.py đều ghi chúng:
+
+  timestamp_precision_status : precise | device_buffer | host_arrival | synthesized
+  t_quantization_us          : độ rộng accumulation window (0 = không quantise —
+                                luôn 0 từ raw_to_events.py, vì không có window nào)
+  timestamp_zero_dt_fraction : tỉ lệ event liên tiếp trùng hệt timestamp
+
+LƯU Ý LỊCH SỬ: bản cũ của guard này chấp nhận cả "unknown", mà converter cũ thì
+không ghi attribute nào cả — nên guard luôn đọc ra "unknown" và cho qua đúng vào
+lúc cần chặn nhất. Giờ thiếu metadata = từ chối. Muốn bỏ qua: --allow-degraded-t.
+Xem nguồn t thật của một recording .cevt cũ:
+    python legacy/cevt_to_events.py <file>.cevt --debug-time-continuity
+(File .raw hiện tại không cần chẩn đoán này — raw_to_events.py luôn ghi
+timestamp_precision_status="precise" vì per-event t là số đo thật từ sensor.)
 
 TÙY CHỌN — OPTUNA (tự động hoá search thay vì tự liệt kê --search)
 --------------------------------------------------------------------
@@ -115,7 +140,13 @@ from measure_event_rate import load_events_h5, analyze  # reuse, don't duplicate
 
 DVSVOLT_K_INDEX = {"k1": 0, "k2": 1, "k3": 2, "k4": 3, "k5": 4, "k6": 5}
 DVSVOLT_RATE_SAFE = {"k1", "k2", "k4", "k5"}   # ảnh hưởng SỐ LƯỢNG event — tin được cả khi t bịa
-DVSVOLT_TIMING_ONLY = {"k3", "k6"}              # ảnh hưởng NOISE/JITTER thời gian — cần XYPT thật
+DVSVOLT_TIMING_ONLY = {"k3", "k6"}              # ảnh hưởng NOISE/JITTER thời gian — cần t chính xác
+# k2 xuất hiện ở CẢ μ (Eq.27: μ = k1/(L+k2)·k_dL + k4 + k5·L, rate) LẪN σ
+# (σ = k3/(L+k2)·√L + k6, jitter) — nên nó được PHÉP calibrate qua path RATE_SAFE
+# (đúng khuyến nghị paper: k1 nhạy nhất, chỉnh trước, rồi k2), nhưng path đó chỉ
+# validate được vai trò μ của nó. Vai trò σ vẫn CHƯA được kiểm chứng sau một lần
+# search RATE_SAFE — xem cảnh báo in ra khi --param k2 trong main().
+DVSVOLT_DUAL_ROLE = {"k2"}
 
 V2E_RATE_SAFE = {"pos_thres", "neg_thres", "refractory_period"}
 V2E_TIMING_ONLY = {"sigma_thres", "cutoff_hz", "leak_rate_hz", "shot_noise_rate_hz"}
@@ -138,15 +169,87 @@ def _h5_attr_to_str(value):
     return str(value)
 
 
-def check_timestamp_precision(real_h5: Path, require_precise: bool):
+# Vocabulary of attrs["timestamp_precision_status"], written by raw_to_events.py
+# (current recorder path) or legacy/cevt_to_events.py (retired Arena path).
+#   precise       : real per-event microsecond sensor timestamp, no accumulation
+#                   window at all -- written by raw_to_events.py (Metavision/.raw,
+#                   the only path currently entitled to this value).
+#   device_buffer : t comes from the camera's own buffer clock — measured, but on
+#                   the legacy Arena/.cevt path every event in one accumulated
+#                   frame shares this one buffer timestamp (t_quantization_us > 0).
+#   host_arrival  : t comes from host buffer-arrival time — measured, but carries
+#                   network + scheduling jitter, so not trustworthy at µs scale.
+#   synthesized   : t was computed from frame_id x window length — a guess.
+#   unknown       : the attribute is absent.
+#
+# "precise" and "device_buffer" are both measured; only "precise" (real per-event
+# t, t_quantization_us == 0) is tight enough for TIMING_ONLY / jitter calibration.
+# "device_buffer" with t_quantization_us > 0 is fine for RATE_SAFE params only.
+_TS_STATUS_MEASURED_TIGHT = {"device_buffer", "precise"}
+_TS_STATUS_MEASURED_LOOSE = {"host_arrival"}
+
+
+def check_timestamp_precision(real_h5: Path, require_precise: bool, purpose: str = "timing"):
+    """
+    Guardrail against calibrating physics on invented timestamps.
+
+    Two things were wrong with the previous version:
+
+    1. It accepted "unknown" (i.e. the attribute missing) as good enough. The old
+       cevt_to_events.py never wrote the attribute at all, so every real
+       recording read as "unknown" and sailed straight through — the guard was
+       inert precisely when it mattered. Missing metadata is now a refusal, not
+       a pass; you cannot certify data you know nothing about.
+
+    2. It checked only the status string, ignoring t_quantization_us. On this
+       camera t is quantised to the accumulation window even when the clock is a
+       genuine device clock, because a dense accumulated frame gives every event
+       in it the same time. So a "device_buffer" file is fine for RATE and for
+       window alignment, and still useless for per-event jitter (k3/k6) work.
+       purpose="jitter" now rejects any quantised file regardless of clock.
+    """
     with h5py.File(real_h5, "r") as hf:
         status = _h5_attr_to_str(hf.attrs.get("timestamp_precision_status", "unknown"))
         zero_dt = float(hf.attrs.get("timestamp_zero_dt_fraction", 0.0))
-    if require_precise and status not in {"precise", "unknown"}:
+        quant_us = float(hf.attrs.get("t_quantization_us", 0.0))
+
+    if not require_precise:
+        return status, zero_dt
+
+    hint = (f"\n  Ghi lại bằng recorder hiện tại (evs_recorder.cpp/Metavision -> .raw) và\n"
+            f"  convert bằng raw_to_events.py để có status='precise' (t thật, không quantise).\n"
+            f"  Nếu file .cevt cũ (Arena, retired), chẩn đoán nguồn t bằng:\n"
+            f"    python legacy/cevt_to_events.py <file>.cevt --debug-time-continuity\n"
+            f"  Nếu file này do converter cũ tạo ra (không có attrs), convert lại bằng\n"
+            f"  legacy/cevt_to_events.py hiện tại để có metadata thật.")
+
+    if status == "unknown":
         raise RuntimeError(
-            f"{real_h5} có timestamp_precision_status={status!r}, "
-            f"zero_dt_fraction={zero_dt:.4f}. Không dùng file này cho Eq.23/timing "
-            f"calibration; record ngắn hơn hoặc dùng raw EVT3/Bpe64 giữ uint64 timestamp.")
+            f"{real_h5} không có attrs['timestamp_precision_status'] — không thể xác "
+            f"nhận t là số đo hay số bịa, nên KHÔNG dùng cho {purpose} calibration.{hint}")
+
+    if status not in (_TS_STATUS_MEASURED_TIGHT | _TS_STATUS_MEASURED_LOOSE):
+        raise RuntimeError(
+            f"{real_h5} có timestamp_precision_status={status!r} "
+            f"(zero_dt_fraction={zero_dt:.4f}): t KHÔNG phải số đo. Không dùng cho "
+            f"{purpose} calibration.{hint}")
+
+    if status in _TS_STATUS_MEASURED_LOOSE:
+        raise RuntimeError(
+            f"{real_h5} có timestamp_precision_status={status!r}: t là thời điểm HOST "
+            f"nhận buffer, có jitter mạng/scheduling, không chính xác cấp µs. Dùng được "
+            f"cho event rate, KHÔNG dùng cho {purpose} calibration. Ghi lại với camera "
+            f"cho device timestamp (xem cột `source` trong --debug-time-continuity), "
+            f"hoặc chạy với --allow-degraded-t nếu bạn chấp nhận sai số này.{hint}")
+
+    if purpose == "jitter" and quant_us > 0:
+        raise RuntimeError(
+            f"{real_h5} có t_quantization_us={quant_us:.1f} — mọi event trong cùng một "
+            f"accumulation window dùng chung 1 timestamp (zero_dt_fraction={zero_dt:.4f}). "
+            f"Phân phối khoảng cách thời gian giữa các event KHÔNG tồn tại trong dữ liệu "
+            f"này, nên không thể tune tham số noise/jitter. Đây là giới hạn phần cứng "
+            f"(camera chỉ xuất dense frame), không phải lỗi file.")
+
     return status, zero_dt
 
 
@@ -232,7 +335,7 @@ def slice_real_to_window(real_h5: Path, duration_s: float, sensor_w: int, sensor
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  N3b · Eq.23 physical contrast-threshold calibration
+#  N3b · Eq.30 physical contrast-threshold calibration
 # ══════════════════════════════════════════════════════════════════════════
 
 def sorted_tiff_paths(folder: Path):
@@ -269,7 +372,7 @@ def count_interval_events(events: dict, t0: float, t1: float, width: int, height
     return on, off
 
 
-def estimate_eq23_thresholds(real_h5: Path, frame_dir: Path, cfg: dict, limit: int,
+def estimate_eq30_thresholds(real_h5: Path, frame_dir: Path, cfg: dict, limit: int,
                              min_dlog: float, min_events: int, time_offset_us: float = 0.0):
     """Estimate C_real = ΔlogL / Nbar(ΔlogL) from a calibrated gray-gradient/ramp clip.
 
@@ -280,11 +383,11 @@ def estimate_eq23_thresholds(real_h5: Path, frame_dir: Path, cfg: dict, limit: i
     """
     events = load_events_h5(real_h5)
     if len(events["t"]) == 0:
-        raise ValueError(f"{real_h5} rỗng — không estimate Eq.23 được.")
+        raise ValueError(f"{real_h5} rỗng — không estimate Eq.30 được.")
 
     paths = sorted_tiff_paths(frame_dir)
     if len(paths) < 2:
-        raise FileNotFoundError(f"Cần >=2 TIFF/PNG frame trong {frame_dir} cho Eq.23.")
+        raise FileNotFoundError(f"Cần >=2 TIFF/PNG frame trong {frame_dir} cho Eq.30.")
     if limit:
         paths = paths[:max(2, min(limit, len(paths)))]
 
@@ -348,7 +451,7 @@ def estimate_eq23_thresholds(real_h5: Path, frame_dir: Path, cfg: dict, limit: i
     c_pos = total_pos_dlog / total_on if total_on >= min_events and total_pos_dlog > 0 else None
     c_neg = total_neg_dlog / total_off if total_off >= min_events and total_neg_dlog > 0 else None
     return dict(
-        method="Eq23_C_real_delta_logL_over_event_count",
+        method="Eq30_C_real_delta_logL_over_event_count",
         frame_dir=str(frame_dir),
         real_h5=str(real_h5),
         fps=fps,
@@ -364,10 +467,10 @@ def estimate_eq23_thresholds(real_h5: Path, frame_dir: Path, cfg: dict, limit: i
     )
 
 
-def apply_eq23_to_config(cfg: dict, simulator: str, estimate: dict):
+def apply_eq30_to_config(cfg: dict, simulator: str, estimate: dict):
     out = copy.deepcopy(cfg)
     if simulator != "v2e":
-        raise ValueError("Eq.23 apply trực tiếp hiện chỉ map sang v2e pos_thres/neg_thres. "
+        raise ValueError("Eq.30 apply trực tiếp hiện chỉ map sang v2e pos_thres/neg_thres. "
                          "DVS-Voltmeter dùng estimate này làm physical target, còn k1..k6 "
                          "vẫn tune bằng closed-loop search.")
     if estimate["c_pos"] is not None:
@@ -444,7 +547,8 @@ def score_candidate(sim_stats: dict, real_stats: dict) -> float:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--real", required=True, help="events_real.h5 (từ xypt_to_h5.py/cevt_to_events.py)")
+    ap.add_argument("--real", required=True,
+                    help="events_real.h5 (từ raw_to_events.py, hoặc legacy/cevt_to_events.py cho data cũ)")
     ap.add_argument("--sim-input", required=True,
                     help="Thư mục TIFF 16-bit (output nhánh Y của preprocess.py), cùng "
                          "cảnh cùng lúc với --real")
@@ -452,14 +556,14 @@ def main():
     ap.add_argument("--param", default=None,
                     help="dvsvolt: k1..k6 | v2e: pos_thres,neg_thres,sigma_thres,"
                          "cutoff_hz,leak_rate_hz,shot_noise_rate_hz")
-    ap.add_argument("--eq23", action="store_true",
+    ap.add_argument("--eq30", action="store_true",
                     help="Estimate physical contrast threshold C_real = ΔlogL/Nbar(ΔlogL) "
                          "from a gray-gradient/ramp clip in --sim-input.")
-    ap.add_argument("--eq23-output", default=None,
-                    help="JSON report path for --eq23 (default: <work-dir>/eq23_estimate.json).")
-    ap.add_argument("--eq23-min-dlog", type=float, default=1e-3,
+    ap.add_argument("--eq30-output", default=None,
+                    help="JSON report path for --eq30 (default: <work-dir>/eq30_estimate.json).")
+    ap.add_argument("--eq30-min-dlog", type=float, default=1e-3,
                     help="Ignore per-pixel |ΔlogL| below this value.")
-    ap.add_argument("--eq23-min-events", type=int, default=10,
+    ap.add_argument("--eq30-min-events", type=int, default=10,
                     help="Minimum ON/OFF events needed before reporting/applying a threshold.")
     ap.add_argument("--time-offset-us", type=float, default=0.0,
                     help="Offset added to real event t_min when aligning frame i to event time.")
@@ -476,7 +580,7 @@ def main():
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--work-dir", default="_calib_work")
     ap.add_argument("--require-precise-t", action="store_true", default=True,
-                    help="Refuse Eq.23/timing calibration if H5 timestamp metadata says degraded.")
+                    help="Refuse Eq.30/timing calibration if H5 timestamp metadata says degraded.")
     ap.add_argument("--allow-degraded-t", action="store_false", dest="require_precise_t",
                     help="Override timestamp precision guardrail.")
     ap.add_argument("--apply", action="store_true",
@@ -488,21 +592,22 @@ def main():
 
     base_cfg = load_config(args.config)
     real_path = Path(args.real)
-    ts_status, zero_dt = check_timestamp_precision(real_path, args.require_precise_t and args.eq23)
+    ts_status, zero_dt = check_timestamp_precision(
+        real_path, args.require_precise_t and args.eq30, purpose="Eq.30")
     print(f"events_real.h5 timestamp_precision_status = {ts_status} "
           f"(zero_dt_fraction={zero_dt:.4f})")
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.eq23:
-        estimate = estimate_eq23_thresholds(
+    if args.eq30:
+        estimate = estimate_eq30_thresholds(
             real_path, Path(args.sim_input), base_cfg, args.limit,
-            args.eq23_min_dlog, args.eq23_min_events, args.time_offset_us)
-        out_path = Path(args.eq23_output) if args.eq23_output else work_dir / "eq23_estimate.json"
+            args.eq30_min_dlog, args.eq30_min_events, args.time_offset_us)
+        out_path = Path(args.eq30_output) if args.eq30_output else work_dir / "eq30_estimate.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(estimate, indent=2))
-        print(f"\n{'='*72}\nEq.23 physical calibration\n{'='*72}")
+        print(f"\n{'='*72}\nEq.30 physical calibration\n{'='*72}")
         print(f"  C_pos = {estimate['c_pos']}  from {estimate['total_on_events']:,} ON events")
         print(f"  C_neg = {estimate['c_neg']}  from {estimate['total_off_events']:,} OFF events")
         print(f"  report -> {out_path}")
@@ -510,14 +615,14 @@ def main():
             cfg_path = Path(args.config)
             backup = cfg_path.with_suffix(cfg_path.suffix + ".bak")
             shutil.copy(cfg_path, backup)
-            final_cfg = apply_eq23_to_config(base_cfg, args.simulator, estimate)
+            final_cfg = apply_eq30_to_config(base_cfg, args.simulator, estimate)
             with open(cfg_path, "w") as f:
                 yaml.safe_dump(final_cfg, f, sort_keys=False, allow_unicode=True)
-            print(f"✓ Đã ghi Eq.23 thresholds vào {cfg_path} (backup: {backup})")
+            print(f"✓ Đã ghi Eq.30 thresholds vào {cfg_path} (backup: {backup})")
         return
 
     if args.param is None:
-        raise ValueError("Cần --param cho closed-loop search, hoặc dùng --eq23.")
+        raise ValueError("Cần --param cho closed-loop search, hoặc dùng --eq30.")
 
     if args.optuna:
         if args.low is None or args.high is None:
@@ -527,15 +632,31 @@ def main():
 
     rate_safe = DVSVOLT_RATE_SAFE if args.simulator == "dvsvolt" else V2E_RATE_SAFE
     timing_only = DVSVOLT_TIMING_ONLY if args.simulator == "dvsvolt" else V2E_TIMING_ONLY
+    dual_role = DVSVOLT_DUAL_ROLE if args.simulator == "dvsvolt" else set()
     valid_params = rate_safe | timing_only
     if args.param not in valid_params:
         raise ValueError(f"--param '{args.param}' không hợp lệ cho simulator="
                           f"{args.simulator}. Hợp lệ: {sorted(valid_params)}")
     if args.param in timing_only:
-        check_timestamp_precision(real_path, args.require_precise_t)
+        check_timestamp_precision(real_path, args.require_precise_t, purpose="jitter")
         print(f"[warning] '{args.param}' thuộc nhóm ảnh hưởng NOISE/JITTER thời gian, "
               "không đáng tin nếu events_real.h5 dùng timestamp bịa (decode_method=dense). "
               "Kiểm tra attrs['decode_method_counts'] của file trước khi tin kết quả này.\n")
+    if args.param in dual_role:
+        # k2 xuất hiện ở CẢ μ (rate, Eq.27) LẪN σ (jitter, Eq.27) — path bên dưới
+        # (RATE_SAFE) chỉ tối ưu theo rate + ON/OFF split, KHÔNG kiểm tra jitter
+        # dù có sẵn precise timestamp hay không. Search này chỉ tìm được k2 khớp
+        # ĐÚNG VỀ RATE; vai trò của nó trong σ (Eq.27) hoàn toàn không được đánh giá
+        # bởi score_candidate() ở đây — một k2 "rate-đúng" hoàn toàn có thể
+        # "jitter-sai" mà kết quả search này không cách nào phát hiện ra.
+        ts_status_for_warn, _ = check_timestamp_precision(real_path, require_precise=False)
+        print(f"[warning] '{args.param}' xuất hiện ở CẢ μ (rate) lẫn σ (jitter) trong Eq.27 "
+              f"DVS-Voltmeter. Search bên dưới CHỈ tối ưu theo rate/ON-OFF-split (RATE_SAFE "
+              f"path) — không đánh giá jitter, kể cả khi events_real.h5 có timestamp chính "
+              f"xác (hiện tại: timestamp_precision_status={ts_status_for_warn!r}). Giá trị k2 "
+              f"tìm được có thể ĐÚNG về rate nhưng SAI về jitter mà kết quả này không thể hiện "
+              f"ra. Muốn kiểm chứng đầy đủ: chạy lại đối chiếu jitter thủ công (hoặc thêm nhánh "
+              f"jitter-aware score cho riêng k2) trên events_real.h5 có status='precise'.\n")
 
     fps = float(base_cfg["camera"]["fps_original"])
     W, H = int(base_cfg["camera"]["width"]), int(base_cfg["camera"]["height"])

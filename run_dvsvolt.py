@@ -164,24 +164,80 @@ def import_sim_class(repo: Path):
                        "— xem VERIFY-2 trong file này")
 
 
+def _describe_signature(cls):
+    """inspect.signature() can raise on some callables; a diagnostic helper must
+    never be the thing that breaks a working path."""
+    try:
+        return f"{cls.__name__}{inspect.signature(cls.__init__)}"
+    except (ValueError, TypeError):
+        return f"{cls.__name__}(<signature not introspectable>)"
+
+
 def construct_sim(cls, K, camera_type, width, height):
+    """
+    Constructs DVS-Voltmeter's EventSim.
+
+    ROOT CAUSE OF THE `AttributeError: 'list' object has no attribute 'SENSOR'`
+    CRASH (fixed here, kept written down so it is not reintroduced a third time):
+
+    EventSim.__init__(cfg, output_folder=None, video_name=None) does an
+    os.path.join(output_folder, ...) internally. Called as cls(cfg) — i.e.
+    output_folder left at its None default — that join raises
+        TypeError: join() argument must be str, not 'NoneType'
+    The old code wrapped the call in `except TypeError` intending to mean "this
+    signature does not match", so that internal TypeError was misread as a
+    signature mismatch. It silently discarded the CORRECT call and fell through
+    to the next trial, which passed the bare list [k1..k6] as `cfg`. A list binds
+    to __init__(self, cfg) perfectly well, so the failure then happened deep
+    inside the third-party repo at `cfg.SENSOR.K[0]` — an AttributeError, which
+    the loop did not catch at all, producing a traceback that pointed at someone
+    else's code and named the wrong cause.
+
+    The fix is not a smarter probe, it is passing a REAL directory. There is one
+    correct call and it is made directly, so any failure now surfaces where it
+    actually happened instead of being reinterpreted.
+    """
     from easydict import EasyDict
-    cfg = EasyDict(dict(
-        SENSOR=dict(CAMERA_TYPE=camera_type, K=list(map(float, K))),
-        DIR=dict(IN_PATH="", OUT_PATH=""),
-        Width=width, Height=height,
-    ))
-    trials = [(cfg,), (list(map(float, K)),), (list(map(float, K)), camera_type), tuple()]
-    last = None
-    for args in trials:
-        try:
-            sim = cls(*args)
-            print(f"  [lib] {cls.__name__}{inspect.signature(cls.__init__)} ← khớp {len(args)} arg")
-            return sim
-        except TypeError as e:
-            last = e
-    raise RuntimeError(f"Constructor {cls.__name__} không khớp cách gọi nào "
-                       f"(lỗi cuối: {last}) — xem VERIFY-2")
+    import tempfile
+
+    cfg = EasyDict()
+    cfg.SENSOR = EasyDict()
+    cfg.DIR = EasyDict()
+
+    cfg.SENSOR.CAMERA_TYPE = camera_type
+    cfg.SENSOR.K = list(map(float, K))
+
+    cfg.DIR.IN_PATH = ""
+    cfg.DIR.OUT_PATH = ""
+
+    cfg.Width = width
+    cfg.Height = height
+
+    # A real, existing directory — this is the whole fix. EventSim joins paths
+    # against it during __init__; None or "" makes that join throw.
+    scratch_dir = tempfile.mkdtemp(prefix="dvsvolt_scratch_")
+
+    try:
+        sim = cls(cfg, output_folder=scratch_dir, video_name="events")
+    except TypeError as e:
+        # Reaching here means the repo's constructor genuinely does not take this
+        # shape (a different fork/version). Report it with the real signature
+        # rather than silently trying something else and corrupting the run.
+        raise RuntimeError(
+            f"{cls.__name__} không nhận (cfg, output_folder=, video_name=): {e}\n"
+            f"  Chữ ký thật: {_describe_signature(cls)}\n"
+            f"  Xem API đầy đủ:  python run_dvsvolt.py --print-sim-api --config <cfg>")
+    except AttributeError as e:
+        # cfg is missing a key this fork reads. Name it — this is the error that
+        # used to arrive disguised as a constructor-signature problem.
+        raise RuntimeError(
+            f"{cls.__name__} đọc một key mà cfg dựng ở đây không có: {e}\n"
+            f"  cfg hiện có: SENSOR.K, SENSOR.CAMERA_TYPE, DIR.IN_PATH, DIR.OUT_PATH, "
+            f"Width, Height\n"
+            f"  Thêm key còn thiếu vào construct_sim() trong file này.")
+
+    print(f"  [lib] {cls.__name__}(cfg)  [scratch: {scratch_dir}]")
+    return sim
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -196,25 +252,58 @@ def construct_sim(cls, K, camera_type, width, height):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _resolve_caller(sim, f0, f1, t0, t1):
+    """
+    Probes which event-generating shape this build of the repo exposes:
+    pair-style .m(f_prev, f_cur, t_prev, t_cur) or stream-style .m(frame, t).
+
+    Only argument BINDING is probed with a TypeError guard — never the body. The
+    distinction matters and is the same one that caused the construct_sim crash:
+    a TypeError raised *inside* a correctly-bound method is a real bug, not a
+    hint to try the next shape. Binding is checked up front with
+    signature.bind(); everything after that is reported, not swallowed.
+
+    The stream probe is destructive (it feeds f0 to prime internal state before
+    f1), which is why it only runs when the pair shape did not bind at all.
+    """
+    failures = []
     for m in ("generate_events", "simulate", "__call__", "run"):
         fn = getattr(sim, m, None)
         if fn is None or not callable(fn):
             continue
-        try:
+
+        def binds(*a):
+            try:
+                inspect.signature(fn).bind(*a)
+                return True
+            except TypeError:
+                return False
+            except (ValueError, AttributeError):
+                return True  # not introspectable — let the actual call decide
+
+        if binds(f0, f1, int(t0), int(t1)):
             ev = fn(f0, f1, int(t0), int(t1))
             print(f"  [lib] method: .{m}(f_prev, f_cur, t_prev, t_cur)")
             return ("pair", fn, ev)
-        except TypeError:
-            pass
-        try:
+
+        if binds(f0, int(t0)):
             fn(f0, int(t0))                      # nạp baseline
             ev = fn(f1, int(t1))
             print(f"  [lib] method: .{m}(frame, t)  [stream/stateful]")
             return ("stream", fn, ev)
-        except TypeError:
-            continue
-    raise RuntimeError("Không khớp được method sinh event nào — xem VERIFY-2 "
-                       "(gửi t signature là t khớp trong 1 phút)")
+
+        failures.append(f"    - .{m}{_describe_method_sig(fn)}: không khớp cả 2 kiểu gọi")
+
+    detail = "\n".join(failures) if failures else "    (không tìm thấy method ứng viên nào)"
+    raise RuntimeError(
+        "Không khớp được method sinh event nào. Đã thử:\n" + detail +
+        "\n  Xem API thật:  python run_dvsvolt.py --print-sim-api --config <cfg>")
+
+
+def _describe_method_sig(fn):
+    try:
+        return str(inspect.signature(fn))
+    except (ValueError, TypeError):
+        return "(<không introspect được>)"
 
 
 def run_lib(repo: Path, paths, t_us, K, camera_type, width, height, seed: int):
@@ -389,7 +478,35 @@ def main():
     ap.add_argument("--mode", choices=["lib", "cli"], default="lib",
                     help="lib = 16-bit + seed (default) | cli = main.py gốc, 8-bit, no seed")
     ap.add_argument("--limit", type=int, default=None, help="chỉ N frame đầu (smoke test)")
+    ap.add_argument("--print-sim-api", action="store_true",
+                    help="In class + chữ ký constructor + các method sinh event của repo "
+                         "DVS-Voltmeter rồi thoát. Thay cho đoạn heredoc VERIFY-2 phải "
+                         "gõ tay. Không cần --input/--output.")
     args = ap.parse_args()
+
+    if args.print_sim_api:
+        # Chạy trước --input/--output vì đây là bước chẩn đoán, không cần data.
+        cfg0 = load_config(args.config)
+        repo0 = Path(cfg0["paths"].get("dvsvolt_repo",
+                                       "~/caroect_sim/DVS-Voltmeter")).expanduser()
+        if not repo0.exists():
+            raise FileNotFoundError(f"DVS-Voltmeter repo chưa có ở {repo0}")
+        mod, cls = import_sim_class(repo0)
+        print(f"module      : {mod.__name__}  ({getattr(mod, '__file__', '?')})")
+        print(f"class       : {cls.__name__}")
+        print(f"__init__    : {_describe_signature(cls)}")
+        print("methods sinh event ứng viên:")
+        for m in ("generate_events", "simulate", "__call__", "run"):
+            fn = getattr(cls, m, None)
+            if callable(fn):
+                try:
+                    print(f"  .{m}{inspect.signature(fn)}")
+                except (ValueError, TypeError):
+                    print(f"  .{m}(<không introspect được>)")
+        print("\ncác class khác trong module:")
+        print("  " + ", ".join(n for n, o in vars(mod).items()
+                               if inspect.isclass(o) and o.__module__ == mod.__name__))
+        return
 
     cfg = load_config(args.config)
     cam, dv, sim = cfg["camera"], cfg["dvs_voltmeter"], cfg.get("simulator", {})

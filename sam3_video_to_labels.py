@@ -11,9 +11,13 @@ of the clip.
 
 VERIFIED FACTS THIS SCRIPT RELIES ON (from the official notebook, not guessed):
   - predictor.handle_request(type="start_session", resource_path=folder)
-    -> {"session_id": ...}. folder must contain "0.jpg","1.jpg",... (clean
+    -> {"session_id": ...}. folder must contain "0.tiff","1.tiff",... (clean
     sequential integer names) - anything else triggers a lexicographic-sort
-    fallback that can scramble true frame order.
+    fallback that can scramble true frame order. TIFF confirmed accepted via
+    SAM3's own sam3/model/io_utils.py IMAGE_EXTS list (PIL decode, .convert
+    ("RGB") is a no-op on already-RGB 8-bit TIFF) — switched from JPG to
+    avoid a second lossy-compression pass on top of the 16->8-bit sRGB
+    quantization preprocess.py/quick_tiff_to_sam3.py already do.
   - predictor.handle_request(type="add_prompt", session_id=..., frame_index=0,
     text=...) -> {"outputs": {...}}  — frame 0 ONLY.
   - predictor.handle_stream_request(type="propagate_in_video", session_id=...)
@@ -31,7 +35,7 @@ VERIFIED FACTS THIS SCRIPT RELIES ON (from the official notebook, not guessed):
     below needs a one-line fix), out_binary_masks (H x W bool per object).
 
 Usage:
-    python sam3_video_to_labels.py /media/duolu/data_ssd1/quick_jpg \
+    python sam3_video_to_labels.py /media/duolu/data_ssd1/quick_tiff8 \
         --prompt "car" --output-dir /media/duolu/data_ssd1/sam3_labels
 """
 
@@ -45,6 +49,7 @@ import cv2
 from PIL import Image
 
 from sam3.model_builder import build_sam3_video_predictor
+from linear16_to_srgb8 import guard_reject_16bit_path, Unexpected16BitInputError
 
 
 def propagate_in_video(predictor, session_id):
@@ -59,20 +64,45 @@ def propagate_in_video(predictor, session_id):
     return outputs_per_frame
 
 
-def load_sorted_frame_paths(folder: str):
+def load_sorted_frame_paths(folder: str, check_8bit: bool = True):
     """Same loading/sorting logic as the official notebook's Cell 13 -
-    integer sort on '<frame_index>.jpg', falling back to lexicographic sort
-    (with a warning) if names don't match that pattern."""
+    integer sort on '<frame_index>.tiff', falling back to lexicographic sort
+    (with a warning) if names don't match that pattern. TIFF only (dropped
+    JPG/PNG) — see module docstring for why.
+
+    check_8bit=True (default): reads each TIFF's header (cheap — no pixel
+    decode) and fails loud if any frame is not uint8. This is the single
+    choke point every SAM3-consuming script in the project routes through
+    (quick_tiff_to_sam3.py, sam3_export_tracks.py, test_sam3.py all import
+    this function) — catches the case where someone points SAM3 straight at
+    a DaVinci 16-bit TIFF export folder, skipping preprocess.py/quick_tiff_
+    to_sam3.py's encode_srgb_u8() step. Without this, PIL's own
+    Image.open(...).convert('RGB') would silently do an uncontrolled linear
+    truncation on 16-bit input (see linear16_to_srgb8.py docstring) — the
+    exact "SAM3 tự áp xuống 8-bit không kiểm soát được" risk this guards
+    against."""
     paths = []
-    for ext in ("*.jpg", "*.jpeg", "*.png"):
+    for ext in ("*.tif", "*.tiff"):
         paths.extend(glob.glob(os.path.join(folder, ext)))
     try:
         paths.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
     except ValueError:
-        print(f"[warning] frame names are not in '<frame_index>.jpg' format: "
+        print(f"[warning] frame names are not in '<frame_index>.tiff' format: "
               f"{paths[:5]}, falling back to lexicographic sort. "
               f"Frame order may not match true time order.")
         paths.sort()
+
+    if check_8bit and paths:
+        bad = []
+        for p in paths:
+            try:
+                guard_reject_16bit_path(p)
+            except Unexpected16BitInputError as e:
+                bad.append(str(e))
+        if bad:
+            raise Unexpected16BitInputError(
+                f"{len(bad)}/{len(paths)} frame(s) in {folder} are not 8-bit — "
+                f"refusing to hand these to SAM3. First error:\n{bad[0]}")
     return paths
 
 
@@ -122,7 +152,7 @@ def write_yolo_label(txt_path, boxes_xywh_norm_kept, class_id=0):
 
 def main():
     ap = argparse.ArgumentParser(description="SAM3 video -> YOLO labels + overlays")
-    ap.add_argument("video_folder", help="Folder of '0.jpg','1.jpg',... frames")
+    ap.add_argument("video_folder", help="Folder of '0.tiff','1.tiff',... frames (8-bit sRGB)")
     ap.add_argument("--prompt", default="car", help="Text prompt (short noun phrase)")
     ap.add_argument("--output-dir", required=True, help="Where to write labels/ and overlay/")
     ap.add_argument("--score-threshold", type=float, default=0.3)
@@ -140,7 +170,7 @@ def main():
 
     frame_paths = load_sorted_frame_paths(args.video_folder)
     if not frame_paths:
-        raise FileNotFoundError(f"No .jpg frames found in {args.video_folder}")
+        raise FileNotFoundError(f"No .tif/.tiff frames found in {args.video_folder}")
     print(f"Found {len(frame_paths)} frame(s): {Path(frame_paths[0]).name} .. "
           f"{Path(frame_paths[-1]).name}")
 

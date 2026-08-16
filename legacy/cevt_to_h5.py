@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# ======================================================================
+# RETIRED - see legacy/README.md. NOT used by run_pipeline.sh.
+#
+# Silently dropped every record whose payload was not exactly width*height bytes,
+# logging one small [skip] line, so a broken recording produced an almost-empty
+# .h5 that looked successful. Also used a nested /events/x schema unlike the rest
+# of the project. Use cevt_to_events.py.
+# ======================================================================
+
 """
 cevt_to_h5.py — Convert CAROECT-D recordings to the unified events.h5 schema.
 

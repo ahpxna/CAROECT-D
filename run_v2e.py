@@ -393,7 +393,7 @@ def main():
                  seed=seed, fps=fps, width=W, height=H,
                  source=str(in_dir), params=v)
     write_h5(out_dir, ev, attrs)
-    print(f"\n✓ Xong. So sánh với event thật:  python read_evt3.py --input <site>.raw --stats\n")
+    print(f"\n✓ Xong. So sánh với event thật:  python measure_event_rate.py <site>_real.h5 <this>/events.h5\n")
 
 
 if __name__ == "__main__":

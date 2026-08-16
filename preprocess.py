@@ -6,7 +6,7 @@ CAROECT-D — Preprocessing v2 (dual-branch, geometry-shared, streaming)
 WHAT CHANGED vs v1 (and why)
 ----------------------------
 1. DUAL BRANCH. One run now produces BOTH outputs the project needs:
-     branch A (--output-rgb): sRGB-encoded 8-bit PNGs  -> SAM3+DINO labeling
+     branch A (--output-rgb): sRGB-encoded 8-bit TIFFs -> SAM3+DINO labeling
      branch B (--output):     linear luminance 16-bit TIFFs -> v2e / DVS-Voltmeter
 2. GEOMETRY SHARED BY CONSTRUCTION. Undistort + resize (+ optional stabilize)
    run EXACTLY ONCE on a single shared RGB array; both branches derive from
@@ -38,7 +38,7 @@ PIPELINE (all float32 until the final write of each branch)
      N6   RESIZE        INTER_AREA -> event sensor resolution (1280x720)
      N6.5 STABILIZE     optional, two-pass, applied to the SHARED RGB
      ── branch split (photometric only from here; geometry is frozen) ──
-     N7a  sRGB ENCODE   IEC 61966-2-1 curve -> 8-bit PNG   [SAM3 branch]
+     N7a  sRGB ENCODE   IEC 61966-2-1 curve -> 8-bit TIFF  [SAM3 branch]
      N7b  RGB -> Y      Rec.2020 luma -> (optional bilateral) -> 16-bit TIFF
 
 TONE MAY DIFFER BETWEEN BRANCHES; GEOMETRY MUST NOT. sRGB encode and
@@ -56,6 +56,8 @@ import yaml
 import argparse
 import time
 from pathlib import Path
+
+from linear16_to_srgb8 import encode_srgb_u8
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -255,11 +257,12 @@ def apply_stab(rgb_small: np.ndarray, warp) -> np.ndarray:
 #  Why sRGB at all: SAM3/DINO were trained on millions of sRGB photos;
 #  scene-linear frames look flat/dark to them. The curve is monotonic and
 #  per-pixel -> changes values only, never positions -> labels unaffected.
-
-def encode_srgb_u8(rgb_lin: np.ndarray) -> np.ndarray:
-    n = np.clip(rgb_lin / 65535.0, 0.0, 1.0)
-    s = np.where(n <= 0.0031308, n * 12.92, 1.055 * np.power(n, 1.0 / 2.4) - 0.055)
-    return np.clip(np.rint(s * 255.0), 0, 255).astype(np.uint8)
+#
+#  encode_srgb_u8() now lives in linear16_to_srgb8.py (single source of
+#  truth — used to be copy-pasted here AND in quick_tiff_to_sam3.py, which
+#  is exactly the kind of silent-drift tech debt the project tries to avoid;
+#  see that file's docstring for the full explanation, including why a
+#  16-bit TIFF must never reach SAM3 unconverted).
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -329,8 +332,9 @@ def process_sequence(args, cfg):
     print(f"  RGB (SAM3) -> {out_rgb if out_rgb else '(disabled — no --output-rgb)'}")
     print(f"  transfer={transfer}  stab={'Y' if pp['stabilize'] else '-'}  "
           f"denoise={pp['denoise']}(Y-branch only)")
-    print(f"  reminder: #TIFFs ≈ clip_seconds x {cam['fps_original']} (capture fps), "
-          f"NOT x {cam['fps_export']}")
+    print(f"  reminder: #TIFFs ≈ real_seconds x {cam['fps_original']} (capture fps, "
+          f"real_seconds = đồng hồ thật của cảnh quay — KHÔNG phải theo timeline đã "
+          f"relabel/kéo dài), NOT x {cam['fps_export']}")
     print(f"{'━'*64}\n")
 
     # Undistort maps: need the real frame size -> peek at frame 0 once.
@@ -361,7 +365,13 @@ def process_sequence(args, cfg):
         # ── branch split: geometry is FROZEN above this line ──
         if out_rgb is not None:                              # N7a SAM3 branch
             srgb = encode_srgb_u8(rgb)
-            cv2.imwrite(str(out_rgb / (p.stem + ".png")), srgb[:, :, ::-1])  # RGB->BGR
+            # 8-bit TIFF, not PNG/JPG: SAM3's own loader (io_utils.py IMAGE_EXTS) accepts
+            # .tiff natively via PIL, so this is the SAME container family as the rest of
+            # the pipeline (calibrate.py/preprocess.py/run_v2e.py/run_dvsvolt.py all speak
+            # TIFF) — one less format to reason about, and no JPEG quantization on top of
+            # the sRGB quantization we already do here. RGB order kept as-is (tifffile
+            # writes RGB directly; no BGR swap needed, unlike cv2.imwrite).
+            tifffile.imwrite(str(out_rgb / (p.stem + ".tiff")), srgb, photometric="rgb")
             if i == 0:
                 first_srgb = srgb
 
@@ -371,7 +381,13 @@ def process_sequence(args, cfg):
         elif pp["denoise"] not in ("none", None):
             raise ValueError(f"denoise must be 'none'|'bilateral', got {pp['denoise']}")
         tifffile.imwrite(str(out_y / (p.stem + ".tiff")),
-                         np.clip(Y, 0, 65535).astype(np.uint16))   # the ONLY uint16 clip
+                         np.clip(np.rint(Y), 0, 65535).astype(np.uint16))   # the ONLY uint16 clip
+        # np.rint() before the cast: .astype(uint16) alone TRUNCATES (floors toward
+        # zero), inconsistent with the round-explicit convention used everywhere
+        # else float->int happens in this project (np.rint() in normalize_events(),
+        # np.round() for the 8-bit PNG export in run_dvsvolt.py). This is the ONLY
+        # quantization point in the whole event branch, so worth being consistent
+        # even though the error is tiny (~0.5 DN out of 65535).
         if i == 0:
             first_Y = Y
 
@@ -394,7 +410,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="CAROECT-D preprocessing v2 (dual-branch)")
     ap.add_argument("--input", required=True, help="DaVinci export dir (16-bit RGB TIFFs)")
     ap.add_argument("--output", required=True, help="OUT: linear luminance TIFFs (event branch)")
-    ap.add_argument("--output-rgb", default=None, help="OUT: sRGB PNGs (SAM3 branch); omit to skip")
+    ap.add_argument("--output-rgb", default=None, help="OUT: sRGB 8-bit TIFFs (SAM3 branch); omit to skip")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()

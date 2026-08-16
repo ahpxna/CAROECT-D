@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# ======================================================================
+# RETIRED - see legacy/README.md. NOT used by run_pipeline.sh.
+#
+# Reads a CAROXYP1 container from `evs_recorder --flat-xypt`. That flag was
+# removed and never worked: node EvsOutputFormat does not exist on the TRT009S-E,
+# and neither does PixelFormat/LucidXYTP128f. No file in this format was ever
+# written. Use cevt_to_events.py.
+# ======================================================================
+
 """
 xypt_to_h5.py — Đọc file .cevt dạng MỚI (magic "CAROXYP1", ghi bởi
 evs_recorder.cpp --flat-xypt) thành events.h5 theo đúng schema chung

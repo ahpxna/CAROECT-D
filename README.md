@@ -62,20 +62,17 @@ label_transfer.py                windows for each simulator
 build_event_dataset.py           YOLO event pseudo-images
 ```
 
-`pipeline.sh` van ton tai nhu wrapper cu:
-
-```bash
-./pipeline.sh data/tiff/site01 site01 train
-```
-
 ## Ghi event that
 
-Sau khi confirm camera co XYPT:
-
 ```bash
-./evs_recorder --output site01.cevt --event-format EVT3_0 --strict-xypt --flat-xypt --duration 60
+./evs_recorder --output site01.cevt \
+               --event-format EVT3_0 --event-format-size Bpe16 \
+               --duration 60
 ./run_pipeline.sh real site01.cevt site01
 ```
+
+`--event-format-size` la BAT BUOC. Neu khong truyen, camera giu lai gia tri con
+sot lai tu phien truoc va khong co gi bao cho ban biet.
 
 Output:
 
@@ -84,6 +81,39 @@ data/events_real/site01.h5
 ```
 
 Schema H5 chung cho real/v2e/dvsvolt la `x`, `y`, `t` microseconds, `p` with `1=ON, 0=OFF`.
+
+### Gioi han phan cung — doc truoc khi tin bat ky con so thoi gian nao
+
+Camera nay (TRT009S-E) **khong xuat event thua (sparse)**. Moi payload la mot
+DENSE ACCUMULATED FRAME dung `width*height` byte (1280x720 = 921600):
+`128` = khong co event, `0` = OFF, `255` = ON.
+`AcquisitionAccumulationMode` — cong tac bat sparse — bi khoa cung o firmware
+(`IsAvailable=false`), da quet het >2160 node ma khong co duong mo. Day la gioi
+han thiet bi, khong phai bug code. Can ghi ro trong phan limitation cua paper.
+
+Hau qua: **khong ton tai timestamp rieng cho tung event.** Mot dense frame chi
+noi "pixel nay co fire o dau do trong cua so nay"; thu tu ben trong cua so bi
+pha huy trong camera. Vi vay:
+
+- Moi event trong cung 1 frame dung chung 1 timestamp cua frame do.
+- `.cevt` (container `CAROEVT2`) ghi lai thoi gian **do duoc**: device clock neu
+  camera cho, khong thi host arrival time, kem co `timestampSource` tung record.
+  Header cung chua `AcquisitionFrameRate`/`AcquisitionFrameTime` doc thang tu
+  camera — nen **khong con phai doan `--fps`** nua.
+- `events.h5` ghi ro muc do tin cay vao `attrs`:
+  `timestamp_precision_status` (`device_buffer` | `host_arrival` | `synthesized`),
+  `t_quantization_us`, `timestamp_zero_dt_fraction`, `decode_method_counts`.
+  `calibrate_simulator.py` doc cac attr nay va **tu choi** timing/Eq.30
+  calibration khi t khong dang tin.
+
+Kiem tra nguon thoi gian truoc khi calibrate:
+
+```bash
+python cevt_to_events.py site01.cevt --debug-time-continuity
+python inspect_cevt.py  site01.cevt
+```
+
+Neu can event thua that su, dung `run_v2e.py` / `run_dvsvolt.py` mo phong tu RGB.
 
 ## Calibrate simulator voi event that
 
@@ -117,4 +147,18 @@ So sanh domain-transfer calibrated vs uncalibrated:
 - `sam3_export_tracks.py`: export multi-class tracks, boxes, masks, timestamps.
 - `label_transfer.py`: identity geometry plus shared-clock windowing, mask-aware per-event stats.
 - `build_event_dataset.py`: render event windows thanh anh 3 kenh YOLO.
-- `evs_recorder.cpp` + `xypt_to_h5.py`: duong real event qua Arena SDK va flat XYPT.
+- `evs_recorder.cpp`: ghi `.cevt` (CAROEVT2) qua Arena SDK, kem timestamp do duoc.
+- `cevt_to_events.py`: `.cevt` -> `events.h5`, converter chinh thuc duy nhat.
+- `inspect_cevt.py` / `cevt_to_video.py`: kiem tra container va xem lai recording.
+
+## Legacy
+
+Cac file duoi day da nghi huu va nam trong `legacy/`. Khong con duoc
+`run_pipeline.sh` goi. Xem `legacy/README.md` de biet ly do cu the tung file.
+
+| File | Ly do |
+|---|---|
+| `legacy/xypt_to_h5.py` | XYPT khong ton tai tren firmware nay; chua bao gio co file nao duoc ghi ra o dinh dang do. |
+| `legacy/cevt_to_h5.py` | Am tham vut bo moi record sai kich thuoc, tao ra `.h5` gan nhu rong ma trong nhu thanh cong. |
+| `legacy/record_evs.py`, `legacy/read_evt3.py` | Can Metavision/OpenEB va sparse `.raw` EVT3.0 — camera khong tao ra duoc. |
+| `legacy/pipeline.sh` | Wrapper cu, dung o `events.h5`, con tham chieu co XYPT da bi go. |

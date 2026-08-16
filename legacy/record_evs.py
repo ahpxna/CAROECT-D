@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ======================================================================
+# RETIRED - see legacy/README.md. NOT used by run_pipeline.sh.
+#
+# Depends on the Metavision/OpenEB SDK and a sparse .raw EVT3.0 stream. This
+# camera cannot produce one: AcquisitionAccumulationMode is firmware-locked at
+# IsAvailable=false. Use evs_recorder.cpp -> cevt_to_events.py.
+# ======================================================================
+
 """
 CAROECT-D — Record real events from LUCID Triton2 EVS (TRT009S-EC)
 ==================================================================
