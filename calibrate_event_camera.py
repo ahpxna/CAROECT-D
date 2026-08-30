@@ -86,6 +86,15 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
+def load_cached_event_intrinsics(path: Path):
+    """Load cached K/D while tolerating pre-RMS NPZ files from older runs."""
+    data = np.load(path)
+    if "K_event" not in data or "D_event" not in data:
+        return None, None, None
+    rms = float(data["rms_event_intrinsic_px"]) if "rms_event_intrinsic_px" in data else None
+    return data["K_event"], data["D_event"], rms
+
+
 def ec_cfg(cfg):
     """Optional tunables under event_calibration: — sensible defaults if the
     section isn't present yet, same .get()-with-default convention used
@@ -396,7 +405,8 @@ def main():
 
         calib_dir.mkdir(parents=True, exist_ok=True)
         out_path = calib_dir / "event_camera_params.npz"
-        np.savez(out_path, K_event=K_ev, D_event=D_ev)
+        np.savez(out_path, K_event=K_ev, D_event=D_ev,
+                 rms_event_intrinsic_px=np.array(float(rms_ev)))
         print(f"\n✓ Saved {out_path}  (K_event, D_event only — no H/R/t yet)")
         print(f"  Next: once the RGB rig is available, re-run this script WITHOUT "
               f"--event-only, with --rgb-dir pointing at a SAME-SESSION paired "
@@ -449,10 +459,12 @@ def main():
     # ── Event-camera intrinsics: reuse a prior --event-only run if present ──
     existing_path = calib_dir / "event_camera_params.npz"
     K_ev = D_ev = None
+    rms_ev = None
+    intrinsics_source = "current_session"
     if existing_path.exists():
-        d = np.load(existing_path)
-        if "K_event" in d and "D_event" in d:
-            K_ev, D_ev = d["K_event"], d["D_event"]
+        K_ev, D_ev, rms_ev = load_cached_event_intrinsics(existing_path)
+        if K_ev is not None:
+            intrinsics_source = "cached"
             print(f"  Reusing cached K_event/D_event from {existing_path} "
                   f"(computed by an earlier --event-only run) rather than "
                   f"recomputing from this cross-registration session's "
@@ -525,7 +537,6 @@ def main():
         proj = proj[:, :2] / proj[:, 2:3]
         homog_err = float(np.linalg.norm(proj - ev_u, axis=1).mean())
 
-        proj_ev, _ = cv2.projectPoints(objp, rvec, tvec, K_ev, D_ev)
         # rvec/tvec above are RGB-frame pose; compose with stereo (R,t) to
         # get the pose in the event camera's own frame for a fair reprojection.
         rvec_ev, _ = cv2.Rodrigues(R @ cv2.Rodrigues(rvec)[0])
@@ -544,13 +555,18 @@ def main():
 
     # ── Save (preserve K_event/D_event whether freshly computed or reused) ─
     calib_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(calib_dir / "event_camera_params.npz",
-             K_event=K_ev, D_event=D_ev, H_rgb_to_event=H_mat, R=R, t=t)
+    save_payload = dict(
+        K_event=K_ev, D_event=D_ev, H_rgb_to_event=H_mat, R=R, t=t,
+    )
+    if rms_ev is not None:
+        save_payload["rms_event_intrinsic_px"] = np.array(float(rms_ev))
+    np.savez(calib_dir / "event_camera_params.npz", **save_payload)
 
     report_path = calib_dir / "event_calib_report.json"
     report_path.write_text(json.dumps(dict(
         n_poses_used=n_valid,
-        rms_event_intrinsic_px=float(rms_ev),
+        rms_event_intrinsic_px=None if rms_ev is None else float(rms_ev),
+        intrinsics_source=intrinsics_source,
         rms_stereo_px=float(rms_stereo),
         homography_inliers=n_inliers,
         homography_total_points=int(len(rgb_pool)),

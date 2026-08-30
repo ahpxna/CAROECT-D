@@ -1,42 +1,33 @@
 #!/usr/bin/env python3
 """
-CAROECT-D — v2e driver (16-bit path, KHÔNG sửa source v2e)
-==========================================================
+CAROECT-D v2e driver with a high-precision input path.
 
-WHY THIS FILE EXISTS
+Why this file exists
 --------------------
-v2e CLI đọc input qua reader 8-bit của nó → nghiền nát dynamic range 16-bit
-linear mà preprocess.py giữ gìn. Thay vì fork v2e, driver này gọi thẳng class
-EventEmulator của v2e như một LIBRARY và tự đút frame float 16-bit-precision
-vào. Physics của v2e không dính một dòng diff nào → paper vẫn cite
-"v2e [Hu et al. 2021]" sạch sẽ.
+v2e's command-line reader normally decodes 8-bit video, which would discard
+the sub-8-bit information retained by the linear uint16 pipeline. Library mode
+loads each TIFF into float32 on v2e's expected 0..255 DN scale without rounding
+and calls the published EventEmulator directly. No simulator physics is forked.
 
-2 MODES
--------
-  --mode lib  (DEFAULT)  16-bit precision, gọi EventEmulator trực tiếp.
-                         Nếu import/API fail (version drift) → báo lỗi to,
-                         kèm hướng dẫn; KHÔNG âm thầm rớt xuống 8-bit.
-  --mode cli  (FALLBACK) chạy binary v2e.py gốc qua subprocess trên video
-                         lossless 8-bit dựng từ TIFF. Chạy được ngay trong
-                         mọi version, đổi lại mất precision dưới 8-bit.
+Modes
+-----
+lib (default) preserves uint16-derived float precision and fails loudly on API
+drift. cli is a documented compatibility fallback that creates lossless 8-bit
+video and therefore intentionally loses sub-8-bit precision.
 
-DATA FLOW
+Data flow
 ---------
-  linear luminance TIFFs (preprocess.py, 16-bit, 1280x720)
-      │
-      ├─[lib]─ N1 FRAMES → N2 LOAD f32(0..255) → N3 EMULATOR → N4 LOOP ─┐
-      │                                                                  │
-      └─[cli]─ C1 PNG8 → C2 ffmpeg lossless AVI → C3 v2e.py subprocess ─┤
-                                                                         ▼
-                                        N5 NORMALIZE (tự suy cột t,x,y,p)
-                                                                         ▼
-                                        N6 events.h5  (x,y,t[µs],p{0,1})
-                                          + params.json (mọi tham số + git hash)
+Linear luminance TIFF -> float 0..255 -> EventEmulator -> inferred t/x/y/p
+columns -> unified events.h5 plus params.json and simulator git provenance.
+Frames stream from disk; a full clip is never preloaded.
 
-Usage (chạy TRONG env v2e):
-  conda run -n v2e python run_v2e.py --input data/processed/site01 --output data/events_v2e/site01
-  conda run -n v2e python run_v2e.py ... --limit 120        # smoke test
-  conda run -n v2e python run_v2e.py ... --mode cli         # fallback 8-bit
+Capture timestamps always use camera.fps_original. fps_export describes only
+the export timeline and would introduce a large timing error here.
+
+Usage:
+  conda run -n v2e python run_v2e.py --input processed --output events
+  conda run -n v2e python run_v2e.py --input processed --output events --limit 120
+  conda run -n v2e python run_v2e.py --input processed --output events --mode cli
 """
 
 import sys
@@ -78,18 +69,16 @@ def git_hash(repo: Path) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 #  NODE 1 · FRAME LIST + TIMESTAMPS
 # ══════════════════════════════════════════════════════════════════════════
-#  in   : --input dir (output của preprocess.py), fps_original từ config
+#  in   : preprocess.py output directory and configured fps_original
 #  out  : (paths, t_us)  → N2/N4
-#  what : liệt kê TIFF theo tên; timestamp t_us[i] = round(i · 1e6 / fps).
-#  why  : fps PHẢI là fps_original (119.88) — capture thật — chứ không phải
-#         fps_export (29.98) của DaVinci; sai cái này timestamp lệch 4×
-#         (đúng cái bẫy đã ghi trong config.yaml).
+#  what : sort TIFFs and assign t_us[i] = round(i * 1e6 / fps).
+#  why  : timestamps require capture fps_original, never export-timeline FPS.
 # ══════════════════════════════════════════════════════════════════════════
 
 def list_frames(input_dir: Path, fps: float, limit: int | None):
     paths = sorted(set(list(input_dir.glob("*.tif")) + list(input_dir.glob("*.tiff"))))
     if not paths:
-        raise FileNotFoundError(f"Không thấy .tif/.tiff trong {input_dir}")
+        raise FileNotFoundError(f"No .tif/.tiff frames found in {input_dir}")
     if limit:
         paths = paths[:limit]
     t_us = np.array([round(i * 1e6 / fps) for i in range(len(paths))], dtype=np.int64)
@@ -100,37 +89,27 @@ def list_frames(input_dir: Path, fps: float, limit: int | None):
 #  NODE 2 · LOAD 16-bit → float32 (0..255)
 # ══════════════════════════════════════════════════════════════════════════
 #  in   : path 1 TIFF 16-bit grayscale  ← N1
-#  out  : frame f32 H×W, dải 0..255 NHƯNG có giá trị lẻ (sub-8bit)  → N4
-#  what : chia 257.0 (65535/257 = 255.0 chính xác) để đổi thang 16-bit về
-#         "đơn vị DN 0..255" mà model v2e (hàm lin_log, ngưỡng 20 DN) được
-#         thiết kế quanh nó.
-#  why  : đây là mấu chốt của cả file — giữ nguyên precision 16-bit (float,
-#         không làm tròn) trong khi vẫn nói đúng "ngôn ngữ đơn vị" của v2e.
-#         Ép uint8 mới là thứ giết dynamic range, còn float 0..255 thì không.
+#  out  : float32 HxW on 0..255 with fractional sub-8-bit values
+#  what : divide by 257 because 65535/257 equals 255 exactly.
+#  why  : preserve uint16 precision while using the DN scale expected by v2e.
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_frame_f32(path) -> np.ndarray:
     img = tifffile.imread(str(path))
     if img.ndim != 2:
-        raise ValueError(f"{Path(path).name}: cần grayscale HxW, gặp shape {img.shape} "
-                         "(đây phải là OUTPUT của preprocess.py, không phải TIFF DaVinci)")
+        raise ValueError(
+            f"{Path(path).name}: expected grayscale HxW preprocessing output, got {img.shape}")
     return img.astype(np.float32) / 257.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  NODE 3 · EMULATOR (lib mode)
 # ══════════════════════════════════════════════════════════════════════════
-#  in   : repo v2e, params từ config, seed  ← N0
+#  input: v2e repository, config parameters, and seed from N0
 #  out  : EventEmulator instance  → N4
-#  what : import v2ecore.emulator.EventEmulator, lọc kwargs qua
-#         inspect.signature để sống sót qua khác biệt version (arg nào
-#         emulator không nhận thì bỏ + in ra cho m biết).
-#  why  : KHÔNG sửa source v2e; mọi physics param đi qua constructor —
-#         tức là qua config.yaml — nên paper report được đầy đủ.
-#  VERIFY-1: tên module/class/method (v2ecore.emulator, EventEmulator,
-#         generate_events(frame, t_seconds)) là theo docs/tutorial v2e.
-#         Nếu ImportError/AttributeError → chạy `--mode cli` trước, rồi gửi
-#         t output của:
+#  what : import EventEmulator and filter kwargs through its live signature.
+#  why  : tolerate API-version differences without modifying v2e physics.
+#  VERIFY-1: module/class/method names follow the official v2e tutorial.
 #           conda run -n v2e python -c "import v2ecore.emulator as e; import inspect; print(inspect.signature(e.EventEmulator.__init__)); print([m for m in dir(e.EventEmulator) if 'event' in m.lower()])"
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -156,8 +135,8 @@ def build_emulator(repo: Path, v: dict, seed: int):
     kwargs = {k: w for k, w in want.items() if k in sig.parameters}
     dropped = sorted(set(want) - set(kwargs))
     if dropped:
-        print(f"  [lib] EventEmulator version này không nhận {dropped} → bỏ qua "
-              "(nếu là param quan trọng, xem VERIFY-1 trong file)")
+        print(f"  [lib] This EventEmulator version does not accept {dropped}; omitted. "
+              "Review VERIFY-1 if any field is required.")
     print(f"  [lib] EventEmulator({', '.join(f'{k}={v}' for k, v in kwargs.items())})")
     return EventEmulator(**kwargs)
 
@@ -166,10 +145,9 @@ def build_emulator(repo: Path, v: dict, seed: int):
 #  NODE 4 · SIMULATION LOOP (lib mode)
 # ══════════════════════════════════════════════════════════════════════════
 #  in   : emulator ← N3, frames+t_us ← N1/N2
-#  out  : mảng event Nx4 (thứ tự cột do v2e quyết — N5 sẽ tự suy)  → N5
-#  what : stream từng frame từ đĩa (KHÔNG preload — 7200 frame 720p float
-#         ≈ 26GB RAM), gọi generate_events(frame, t_giây). Call đầu trả
-#         None (frame baseline) — bình thường.
+#  out  : raw Nx4 event array; N5 infers the version-dependent column order
+#  what : stream frames from disk and call generate_events(frame, seconds).
+#         The first call establishes a baseline and may return None.
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_lib(repo: Path, paths, t_us, v: dict, seed: int):
@@ -178,7 +156,7 @@ def run_lib(repo: Path, paths, t_us, v: dict, seed: int):
     t0 = time.time()
     for i, (p, t) in enumerate(zip(paths, t_us)):
         fr = load_frame_f32(p)
-        ev = em.generate_events(fr, float(t) / 1e6)     # VERIFY-1: t tính bằng GIÂY
+        ev = em.generate_events(fr, float(t) / 1e6)     # VERIFY-1: seconds
         if ev is not None and len(ev) > 0:
             chunks.append(np.asarray(ev))
         if (i + 1) % 200 == 0 or (i + 1) == len(paths):
@@ -186,26 +164,23 @@ def run_lib(repo: Path, paths, t_us, v: dict, seed: int):
             print(f"  [lib] {i+1:>6}/{len(paths)}  {r:.1f} fr/s  "
                   f"events: {sum(len(c) for c in chunks):,}")
     if not chunks:
-        raise RuntimeError("v2e không sinh event nào — input phẳng quá hoặc threshold cao quá?")
+        raise RuntimeError("v2e produced no events; input may be flat or thresholds too high.")
     return np.concatenate(chunks, axis=0)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  C1–C4 · CLI FALLBACK (8-bit, chạy binary v2e.py gốc)
+#  C1–C4 · CLI FALLBACK using the original v2e.py binary
 # ══════════════════════════════════════════════════════════════════════════
-#  what : C1 quantize TIFF→PNG 8-bit (MẤT precision — fallback thôi)
-#         C2 ffmpeg đóng thành AVI lossless (FFV1) @ fps_original
-#         C3 subprocess v2e.py với đầy đủ flags từ config (kèm seed)
-#         C4 mở .h5 v2e xuất ra, lấy dataset Nx4 đầu tiên → N5
-#  why  : đường này chỉ dùng flags CLI đã document → gần như chắc chắn chạy
-#         được với mọi version v2e, làm lưới an toàn cho lib mode.
+#  C1 quantizes to PNG8, C2 creates lossless FFV1 video, C3 runs the documented
+#  v2e CLI, and C4 locates its Nx4 HDF5 dataset. This compatibility path
+#  intentionally loses sub-8-bit precision.
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_cli(repo: Path, paths, v: dict, seed: int, fps: float,
             width: int, height: int, workdir: Path):
     import cv2
     if shutil.which("ffmpeg") is None:
-        raise RuntimeError("Thiếu ffmpeg (sudo apt install ffmpeg) — cần cho cli mode.")
+        raise RuntimeError("ffmpeg is missing (sudo apt install ffmpeg); CLI mode requires it.")
 
     # C1 — PNG 8-bit
     png_dir = workdir / "png8"
@@ -223,7 +198,7 @@ def run_cli(repo: Path, paths, v: dict, seed: int, fps: float,
                     "-framerate", f"{fps}", "-i", str(png_dir / "%06d.png"),
                     "-c:v", "ffv1", str(avi)], check=True)
 
-    # C3 — v2e.py (flags theo docs; nếu argparse chê flag lạ → python v2e.py -h)
+    # C3 — documented v2e.py flags; inspect v2e.py -h after API drift.
     out_h5 = "events_v2e_raw.h5"
     cmd = [sys.executable, str(repo / "v2e.py"),
            "--input", str(avi),
@@ -245,9 +220,9 @@ def run_cli(repo: Path, paths, v: dict, seed: int, fps: float,
     print("  [cli] C3: " + " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(repo))
 
-    # C4 — đọc h5 của v2e
+    # C4 — read v2e HDF5 output
     if h5py is None:
-        raise RuntimeError("pip install h5py trong env v2e")
+        raise RuntimeError("Install h5py in the v2e environment.")
     h5path = workdir / out_h5
     found = {}
     with h5py.File(h5path, "r") as f:
@@ -257,36 +232,32 @@ def run_cli(repo: Path, paths, v: dict, seed: int, fps: float,
                 found["arr"], found["name"] = obj[...], name
         f.visititems(visit)
     if "arr" not in found:
-        raise RuntimeError(f"Không thấy dataset Nx4 trong {h5path} — gửi t `h5ls -r {h5path}`")
+        raise RuntimeError(f"No Nx4 dataset found in {h5path}; inspect it with h5ls -r.")
     print(f"  [cli] C4: dataset '{found['name']}'  ({len(found['arr']):,} events)")
     return found["arr"]
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  NODE 5 · NORMALIZE — tự suy cột (t,x,y,p) từ dải giá trị
+#  NODE 5 · NORMALIZE — infer t/x/y/p columns from value constraints
 # ══════════════════════════════════════════════════════════════════════════
-#  in   : Nx4, thứ tự cột KHÔNG biết trước (tùy version/simulator)
+#  in   : Nx4 with version-dependent column order
 #  out  : dict x(u16), y(u16), t(u64 µs, sorted), p(u8 0/1)  → N6
-#  what : p = cột chỉ chứa {-1,0,1};  t = cột đơn điệu tăng, range lớn nhất;
-#         x/y = 2 cột còn lại (cột nào max ≥ height thì là x, vì 1280 > 720).
-#         Đơn vị t: nếu range << duration_kỳ_vọng(µs) → đang là GIÂY → ×1e6.
-#  why  : v2e trả (t,x,y,p) t=giây; file txt DVS-Voltmeter fmt %1.0f;
-#         thay vì TIN tài liệu từng version, suy từ chính data → driver
-#         sống sót qua version drift. In kết quả suy ra cho m soi.
-#  NOTE : cùng một hàm này được copy sang run_dvsvolt.py — CỐ Ý duplicate
-#         để mỗi file tự chạy độc lập không cần module chung.
+#  Polarity contains only {-1,0,1}; time is monotonic with the largest range;
+#  x/y are the remaining columns. A duration-scale check detects seconds and
+#  converts them to microseconds. The duplicated DVS-Voltmeter helper keeps
+#  both simulator runners independently executable.
 # ══════════════════════════════════════════════════════════════════════════
 
 def normalize_events(arr, width: int, height: int, dur_us_hint: float):
     a = np.asarray(arr, dtype=np.float64)
     if a.ndim != 2 or a.shape[1] != 4:
-        raise ValueError(f"Cần Nx4, gặp {a.shape}")
+        raise ValueError(f"Expected an Nx4 array, got {a.shape}")
     cols = set(range(4))
 
     p_col = next((c for c in cols
                   if set(np.unique(a[:, c]).astype(np.int64).tolist()) <= {-1, 0, 1}), None)
     if p_col is None:
-        raise ValueError("Không tìm được cột polarity (giá trị ngoài {-1,0,1})")
+        raise ValueError("Could not identify a {-1,0,1} polarity column")
     cols.discard(p_col)
 
     t_col, best = None, -1.0
@@ -296,7 +267,7 @@ def normalize_events(arr, width: int, height: int, dur_us_hint: float):
             r = a[:, c].max() - a[:, c].min()
             if r > best:
                 best, t_col = r, c
-    if t_col is None:                                   # không cột nào monotonic (lạ)
+    if t_col is None:                                   # Unusual non-monotonic fallback.
         t_col = max(cols, key=lambda c: a[:, c].max())
     cols.discard(t_col)
 
@@ -306,7 +277,7 @@ def normalize_events(arr, width: int, height: int, dur_us_hint: float):
     elif a[:, c2].max() >= height > a[:, c1].max():
         x_col, y_col = c2, c1
     else:
-        x_col, y_col = c1, c2                           # mơ hồ → giữ thứ tự, tự soi log
+        x_col, y_col = c1, c2                           # Ambiguous: preserve order and log it.
 
     t = a[:, t_col].copy()
     unit = "µs"
@@ -317,7 +288,7 @@ def normalize_events(arr, width: int, height: int, dur_us_hint: float):
     p = np.where(a[:, p_col] > 0, 1, 0).astype(np.uint8)
     order = np.argsort(t, kind="stable")
 
-    print(f"  [norm] suy cột: t=c{t_col}({unit})  x=c{x_col}  y=c{y_col}  p=c{p_col}"
+    print(f"  [norm] inferred columns: t=c{t_col}({unit})  x=c{x_col}  y=c{y_col}  p=c{p_col}"
           f"   |  {len(t):,} events, {t.max()/1e6 - t.min()/1e6:.2f}s")
     x = np.clip(np.rint(a[order, x_col]), 0, width - 1).astype(np.uint16)
     y = np.clip(np.rint(a[order, y_col]), 0, height - 1).astype(np.uint16)
@@ -330,11 +301,10 @@ def normalize_events(arr, width: int, height: int, dur_us_hint: float):
 # ══════════════════════════════════════════════════════════════════════════
 #  NODE 6 · WRITE UNIFIED H5
 # ══════════════════════════════════════════════════════════════════════════
-#  in   : dict từ N5 + metadata
+#  input: dictionary from N5 plus metadata
 #  out  : events.h5 (schema GIỐNG read_evt3.py: x,y,t,p gzip) + params.json
-#  why  : v2e / DVS-Voltmeter / event thật từ Triton2 → cùng MỘT format,
-#         code train + code so sánh sim-real chỉ viết một đường đọc.
-#         attrs chứa đủ params + git hash → mỗi file tự khai nguồn gốc.
+#  v2e, DVS-Voltmeter, and real recordings share one schema. Attributes carry
+#  parameters and git provenance so downstream readers need one code path.
 # ══════════════════════════════════════════════════════════════════════════
 
 def write_h5(out_dir: Path, ev: dict, attrs: dict):
@@ -363,18 +333,18 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--mode", choices=["lib", "cli"], default="lib",
-                    help="lib = 16-bit qua EventEmulator (default) | cli = v2e.py gốc, 8-bit")
-    ap.add_argument("--limit", type=int, default=None, help="chỉ N frame đầu (smoke test)")
+                    help="lib = 16-bit through EventEmulator (default) | cli = original v2e.py, 8-bit")
+    ap.add_argument("--limit", type=int, default=None, help="Use only the first N frames")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     cam, v, sim = cfg["camera"], cfg["v2e"], cfg.get("simulator", {})
     seed = int(sim.get("seed", 42))
-    fps = float(cam["fps_original"])                     # 119.88 — KHÔNG phải fps_export
+    fps = float(cam["fps_original"])                     # Capture FPS, not fps_export.
     W, H = int(cam["width"]), int(cam["height"])
     repo = Path(cfg["paths"].get("v2e_repo", "~/caroect_sim/v2e")).expanduser()
     if not repo.exists():
-        raise FileNotFoundError(f"v2e repo chưa có ở {repo} — chạy ./setup_sim.sh trước")
+        raise FileNotFoundError(f"v2e repository not found at {repo}; run setup_sim.sh")
 
     in_dir, out_dir = Path(args.input), Path(args.output)
     paths, t_us = list_frames(in_dir, fps, args.limit)
@@ -393,7 +363,7 @@ def main():
                  seed=seed, fps=fps, width=W, height=H,
                  source=str(in_dir), params=v)
     write_h5(out_dir, ev, attrs)
-    print(f"\n✓ Xong. So sánh với event thật:  python measure_event_rate.py <site>_real.h5 <this>/events.h5\n")
+    print("\nDone. Compare against measured events with measure_event_rate.py.\n")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ formulas below were checked for internal mathematical consistency; see the
 
 **Roadmap.** The pipeline is organized around one governing idea: every downstream
 step — event generation, tracking, and automatic annotation — is only physically
-meaningful if it operates on *scene-linear*, *geometrically frozen* data. Section B
+meaningful if it operates on an explicitly declared *linear Rec.709*, *geometrically frozen* working signal. Section B
 establishes why the radiometric domain must be 16-bit linear rather than 8-bit
 gamma-encoded. Section C establishes a single, shared geometric transform applied
 once to that linear data, before the pipeline forks into an sRGB annotation branch
@@ -61,9 +61,11 @@ for the RGB rig ($w=36$ mm, $f=20$ mm) and $54.8^{\circ}$ for the event rig
 RGB sensor's FOV, spatial alignment (Section C) is fundamentally a cropping and
 registration problem rather than a stereo-baseline problem.
 
-Raw video is processed at the event camera's native frame rate of 119.88 fps. The
-pipeline branches into (i) an sRGB annotation branch that is tone-mapped for SAM 3,
-and (ii) a 16-bit linear event-generation branch. The event branch ultimately yields
+The Nikon records 12-bit SDR N-RAW, not N-Log. DaVinci Resolve performs the declared
+SDR-to-linear transform and exports 16-bit linear Rec.709 RGB at the native
+119.88 fps cadence. Python treats that input as already linear and does not apply a
+second inverse transfer. The pipeline branches into (i) an sRGB annotation branch
+encoded for SAM 3, and (ii) a 16-bit linear event-generation branch. The event branch ultimately yields
 an asynchronous stream of tuples
 
 $$
@@ -145,10 +147,13 @@ $$
 too small to ever cross $\theta$ — the simulator goes blind to real motion in bright
 regions.
 
-### B.3 The 16-bit Linear Solution
+### B.3 The DaVinci-linearized 16-bit Working Signal
 
-CAROECT-D bypasses the ISP entirely and exports 16-bit linear TIFFs directly from
-N-RAW, so $I\in\{0,\dots,65535\}$, a $256\times$ larger quantization space than 8-bit.
+CAROECT-D records 12-bit SDR N-RAW and uses a fixed DaVinci Resolve transform to
+export 16-bit linear Rec.709 TIFFs, so the working boundary has
+$I\in\{0,\dots,65535\}$, a $256\times$ larger code space than 8-bit. This is a
+claim about working precision and transfer provenance, not a claim that TIFF codes
+are untouched photosite measurements or that SDR capture matches IMX636 dynamic range.
 Equation (B.4) shows exactly why this matters: for the *same absolute scene
 darkness* that produced $I{=}1$ at 8-bit, the equivalent 16-bit code value is on the
 order of $I\approx256$ (an 8-to-16-bit scale factor of $65536/256=256$), giving
@@ -158,17 +163,16 @@ $$
 $$
 
 i.e. the *shadow* regime at 16-bit now has the same fine log-intensity resolution
-that only the *brightest* regime enjoyed at 8-bit (compare to (B.6)). Because the
-data also bypasses the non-linear gamma curve, pixel values remain strictly
-proportional to photon count, which is required for (B.3) to reduce to the identity
-$L_{sRGB}=L$ ($\gamma=1$). Together, (B.4)–(B.7) are the mathematical justification
-for the $>120$ dB dynamic range CAROECT-D targets, matching the physical Sony IMX636
-sensor.
+that only the *brightest* regime enjoyed at 8-bit (compare to (B.6)). Because DaVinci has already removed the declared SDR encoding, Python receives a
+linear working signal and must not apply (B.3) a second time. Together, (B.4)–(B.7)
+justify a high-precision linear working representation instead of an 8-bit delivery
+image. Matching the physical Sony IMX636 dynamic range remains an empirical
+calibration question and cannot be inferred from TIFF bit depth alone.
 
 ### B.4 Physical Corrections on Linear Data
 
-Because the exported data remains scene-linear, standard radiometric calibration is
-valid prior to any tone mapping:
+Because DaVinci exports a declared linear-light signal, radiometric corrections can
+be evaluated before the annotation branch applies its sRGB display transfer:
 
 $$
 I_{corr} = (I_{raw} - I_{dark}) \cdot M_{gain} \cdot W_{gain} \cdot S_{exp}, \tag{B.8}
@@ -288,11 +292,9 @@ $$
 Y = c_R R + c_G G + c_B B. \tag{D.2}
 $$
 
-*Note:* the reference v2e implementation defaults to BT.601/BT.709 weights; because
-CAROECT-D operates on wide-gamut, 16-bit linear N-RAW data rather than tone-mapped
-video, this pipeline instead adopts ITU-R BT.2020 weights
-$(c_R,c_G,c_B)=(0.2627, 0.6780, 0.0593)$, which sum to unity and are consistent with
-the sensor's native color primaries. Frame upsampling via Super-SloMo (v2e's optional
+*Note:* CAROECT-D uses a 16-bit linear Rec.709 working signal and therefore
+adopts the matching luminance weights
+$(c_R,c_G,c_B)=(0.2126, 0.7152, 0.0722)$. Frame upsampling via Super-SloMo (v2e's optional
 interpolation step) is disabled, since native capture already occurs at 119.88 fps —
 enabling it would risk hallucinated motion detail.
 
@@ -483,42 +485,64 @@ construction rather than by calibration accuracy.
 
 ### E.3 Temporal Synchronization
 
-SAM 3 produces discrete, per-frame annotations, while both event models of Section D
-produce continuous timestamps $t_k$. Both, however, are driven from the same
-underlying 119.88 fps frame clock:
+SAM 3 emits exact per-frame observations with explicit times $t_k$. Synthetic events
+and RGB labels share the same source clock, hence offset zero by construction.
+Physical RGB/event pairing does not inherit that assumption. A flash or blinking
+target estimates one offset under
 
 $$
-t_i = i \cdot \Delta t_{frame}, \qquad \Delta t_{frame} \approx 8.34~\text{ms}. \tag{E.3}
+t_{\mathrm{event}} = t_{\mathrm{RGB}} + \delta_t, \tag{E.3}
 $$
 
-Because both v2e (D.8) and Raw2Event/DVS-Voltmeter (D.11) generate events strictly
-from the log-intensity transition between frame $i$ and frame $i{+}1$, every event
-resulting from that transition satisfies
+and stores the method, residual, confidence, input files, and units. Physical label
+transfer fails without this synchronization artifact unless an explicit
+unsynchronized diagnostic override is requested.
+
+### E.4 Exact Observations and Causal Windows
+
+Each detector sample ends at exact observation time $t_k$ and uses the unchanged
+SAM 3 box/mask $B_k$:
 
 $$
-t_k \in [t_i, t_{i+1}). \tag{E.4}
+\mathcal W_k(\Delta T)=
+\{e_j\mid t_k-\Delta T\le t_j<t_k\},
+\qquad
+\mathcal W_k(\Delta T)\longrightarrow B_k. \tag{E.4}
 $$
 
-### E.4 The Label-Assignment Operator
+The half-open interval prevents boundary duplication. More importantly, frame
+$k+1$ and events at or after $t_k$ have no influence on sample $k$. The normal
+training path performs no bracket search, $\alpha$ interpolation, extrapolation,
+or per-event box assignment.
 
-Combining the spatial identity of (C.4)/(E.2) with the temporal window of (E.4)
-yields a single spatiotemporal inclusion test. An event $e_k=(x_k,y_k,t_k,p_k)$ is
-assigned object identity $ID_n$ if and only if it falls within the corresponding
-frame's confirmed SAM 3 mask, and inside the correct temporal window:
+CAROECT-D evaluates $\Delta T\in\{8.34,16.7,33.3,50.0\}$ ms. Every variant retains
+the same ordered $t_k$ and labels; only event-history length changes. This detector
+window is independent of the 119.88 fps simulator-input cadence.
+
+### E.5 Bidirectional Track Merge
+
+Forward and backward SAM 3 sessions are independent and seeded at opposite ends of
+the video. Both raw artifacts are preserved. Same-class trajectories are associated
+by temporal overlap and mean IoU. The merge selects continuity first, confidence
+second, and uses a receding score only for otherwise comparable candidates.
+Receding behavior is estimated from decreasing image area and motion toward a
+configured horizon, never from propagation direction.
+
+### E.6 Causal Label-Assignment Operator
+
+For sorted timestamps, event-index bounds are
 
 $$
-\mathrm{Assign}(e_k) =
-\begin{cases}
-ID_n, & t_k \in [t_i, t_{i+1}) \ \wedge\ (x_k, y_k) \in M_{i,n} \\[4pt]
-\text{Background}, & \text{otherwise}
-\end{cases} \tag{E.5}
+a_k=\operatorname{lower\_bound}(t,t_k-\Delta T),\qquad
+b_k=\operatorname{lower\_bound}(t,t_k). \tag{E.5}
 $$
 
-Because the spatial term reduces to a point-in-mask test (no reprojection) and the
-temporal term reduces to a shared-clock interval lookup (no cross-modal
-resynchronization), (E.5) can be evaluated directly on every generated event,
-yielding dense, pixel-accurate class labels, bounding boxes, and consistent tracking
-IDs for the synthetic event stream without manual annotation.
+The representation builder renders indices $[a_k,b_k)$ and pairs the result with
+unchanged $B_k$. Shared synthetic geometry reduces spatial transfer to identity.
+Physical evaluation additionally reports clock-offset residual and RGB/event
+registration error. The outputs are causal frame-observation detector targets, not
+dense interpolated per-event labels.
+
 
 ---
 ---
@@ -543,10 +567,8 @@ IDs for the synthetic event stream without manual annotation.
 5. **(A.1)** Verified the horizontal-FOV formula reproduces both tabulated values in
    the project outline: $84.0^{\circ}$ (Nikon Z6III, 20 mm, 36 mm sensor width) and
    $54.8^{\circ}$ (Triton2/IMX636, 6 mm, 6.2208 mm sensor width).
-6. **(D.2)** Verified the Rec.2020 luma weights sum to unity
-   ($0.2627+0.6780+0.0593=1.0000$); flagged explicitly as a deliberate CAROECT-D
-   deviation from vanilla v2e's default BT.601/709 weights, with justification
-   added to the prose (wide-gamut 16-bit linear input rather than tone-mapped video).
+6. **(D.2)** Verified the Rec.709 luma weights sum to unity
+   ($0.2126+0.7152+0.0722=1.0000$) and match the configured linear working primaries.
 7. **(C.2)** Brown–Conrady equations checked term-by-term against the standard
    (OpenCV) formulation — correct as given in the source, no changes made.
 8. **(C.1)** Pinhole intrinsic matrix checked — correct as given, no changes made.

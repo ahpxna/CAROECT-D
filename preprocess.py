@@ -20,16 +20,16 @@ WHAT CHANGED vs v1 (and why)
    frame as it is produced. Stabilization, which needs whole-clip knowledge,
    became a cheap two-pass design (pass 1 estimates tiny per-frame motion
    params; pass 2 applies them) instead of holding pixel data.
-4. FORMULA-ORDER FIX. v1 ran the optional sRGB->linear input decode AFTER
-   dark/flat/WB. Those corrections are linear-light math; running them on a
-   nonlinear encoding is invalid. Decode now happens FIRST (N1.5). (No-op on
-   the recommended linear export path, so no old data is invalidated.)
+4. TRANSFER OWNERSHIP. Capture uses SDR N-RAW, not N-Log. DaVinci Resolve
+   linearizes it before exporting linear Rec.709 uint16 TIFF. Python validates
+   that declaration and performs no second EOTF/inverse-gamma operation.
+   Legacy decode code remains an isolated helper, not the aligned entry path.
 
 PIPELINE (all float32 until the final write of each branch)
 -----------------------------------------------------------
-   [DaVinci: 16-bit LINEAR Rec.2020 RGB TIFF - ONE export shared by all]
+   [DaVinci: SDR N-RAW -> 16-bit LINEAR Rec.709 RGB TIFF, shared by all]
      N1   LOAD          uint16 -> float32
-     N1.5 TRANSFER      srgb->linear decode IF input_transfer==srgb (else no-op)
+     N1.5 TRANSFER      assert already-linear DaVinci export (no-op)
      N2   DARK          - dark_mean          (no clip: negatives ride through)
      N3   FLAT-FIELD    x gain_map           (measured de-vignette)
      N4   WHITE BALANCE x wb_gains           (gray-card measured)
@@ -39,7 +39,7 @@ PIPELINE (all float32 until the final write of each branch)
      N6.5 STABILIZE     optional, two-pass, applied to the SHARED RGB
      ── branch split (photometric only from here; geometry is frozen) ──
      N7a  sRGB ENCODE   IEC 61966-2-1 curve -> 8-bit TIFF  [SAM3 branch]
-     N7b  RGB -> Y      Rec.2020 luma -> (optional bilateral) -> 16-bit TIFF
+     N7b  RGB -> Y      Rec.709 luma -> (optional bilateral) -> 16-bit TIFF
 
 TONE MAY DIFFER BETWEEN BRANCHES; GEOMETRY MUST NOT. sRGB encode and
 bilateral denoise change VALUES, never positions — labels stay valid.
@@ -55,9 +55,10 @@ import tifffile
 import yaml
 import argparse
 import time
+import json
 from pathlib import Path
 
-from linear16_to_srgb8 import encode_srgb_u8
+from linear16_to_srgb8 import linear_working_to_srgb_u8
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -70,25 +71,45 @@ def load_config(path="config.yaml"):
 
 
 def load_calibration(calib_dir: Path, cfg: dict) -> dict:
-    """Load calibrate.py outputs, gated by config flags. A stage runs later
-    only if its key is present in the returned dict."""
+    """Load validated calibration artifacts for explicitly enabled stages."""
     pp = cfg["preprocessing"]
     calib, loaded = {}, []
+    manifest_path = calib_dir / "calibration_manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
 
-    def maybe(name, flag, key):
-        p = calib_dir / name
-        if flag and p.exists():
-            calib[key] = np.load(str(p))
-            loaded.append(key)
+    def require_validated(stage, config_key, key):
+        if not pp.get(config_key, False):
+            return
+        if manifest is None:
+            raise RuntimeError(
+                f"{config_key} is enabled but {manifest_path} is missing. "
+                "Run calibrate.py with measurement-backed references first.")
+        entry = manifest.get("corrections", {}).get(stage, {})
+        if not entry.get("valid", False):
+            raise RuntimeError(
+                f"{config_key} is enabled but calibration manifest stage {stage!r} "
+                "is absent or invalid.")
+        artifact = calib_dir / entry.get("artifact", "")
+        if not artifact.is_file():
+            raise RuntimeError(f"Validated artifact for {stage!r} is missing: {artifact}")
+        calib[key] = np.load(str(artifact))
+        loaded.append(key)
 
-    maybe("dark_mean.npy", pp["dark_correction"], "dark")   # -> N2
-    maybe("gain_map.npy",  pp["flat_field"],      "gain")   # -> N3
-    maybe("wb_gains.npy",  pp["white_balance"],   "wb")     # -> N4
+    require_validated("residual_offset", "dark_correction", "dark")
+    require_validated("relative_gain_prnu", "flat_field", "gain")
+    require_validated("white_balance", "white_balance", "wb")
 
     # N4.5 exposure normalization: needs BOTH this session's reading and the
     # project-wide canonical target (both from calibrate.py's gray card).
     lv, tg = calib_dir / "exposure_level.npy", calib_dir / "exposure_target.npy"
-    if pp.get("exposure_normalize", False) and lv.exists() and tg.exists():
+    if pp.get("exposure_normalize", False):
+        if manifest is None:
+            raise RuntimeError("exposure_normalize is enabled without calibration_manifest.json")
+        entry = manifest.get("corrections", {}).get("exposure_normalization", {})
+        if not entry.get("valid", False) or not lv.exists() or not tg.exists():
+            raise RuntimeError(
+                "exposure_normalize requires a validated measured reference plus "
+                "exposure_level.npy and exposure_target.npy")
         level, target = float(np.load(str(lv))), float(np.load(str(tg)))
         calib["exposure_scalar"] = target / level if level > 0 else 1.0
         loaded.append(f"exposure(x{calib['exposure_scalar']:.4f})")
@@ -100,7 +121,8 @@ def load_calibration(calib_dir: Path, cfg: dict) -> dict:
         calib["calib_size"] = tuple(int(v) for v in d["image_size"]) if "image_size" in d else None
         loaded.append("K/D")
 
-    print(f"  Calibration loaded: {', '.join(loaded) if loaded else 'none (raw passthrough)'}")
+    calib["applied_corrections"] = loaded.copy()
+    print(f"  Calibration loaded: {', '.join(loaded) if loaded else 'none (linearized working signal)'}")
     return calib
 
 
@@ -121,12 +143,10 @@ def load_tiff(path) -> np.ndarray:
 
 def decode_transfer(rgb: np.ndarray, transfer: str) -> np.ndarray:
     """
-    N1.5 — bring the file's encoding to scene-linear BEFORE any physical
-    correction (dark/flat/WB are linear-light math; order is not optional).
-    'linear' (the recommended DaVinci export) is a no-op.
-    NOTE: if you ever use 'srgb' here, the calibration TIFFs (dark/flat/
-    gray-card) must have gone through the SAME encoding — capture them via
-    the same export path as the footage or the corrections won't match.
+    Convert a declared encoding to linear-light values. The aligned CAROECT-D
+    entry point accepts only ``linear`` because DaVinci owns the SDR-to-linear
+    transform. The ``srgb`` branch is retained for isolated legacy conversion
+    tests, not for the current acquisition workflow.
     """
     if transfer == "linear":
         return rgb
@@ -248,7 +268,7 @@ def apply_stab(rgb_small: np.ndarray, warp) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  N7a sRGB ENCODE (SAM3 branch)  — IEC 61966-2-1, applied LAST
+#  N7a LINEAR GAMUT CONVERSION + sRGB TRANSFER, applied last
 # ══════════════════════════════════════════════════════════════════
 #  Why last: interpolation inside undistort/resize is a weighted AVERAGE of
 #  neighboring pixels, and averaging is only physically correct on LINEAR
@@ -266,11 +286,10 @@ def apply_stab(rgb_small: np.ndarray, warp) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  N7b RGB -> Y (event branch)  — Rec.2020 luminance, from config
+#  N7b RGB -> Y (event branch) — linear Rec.709 luminance, from config
 # ══════════════════════════════════════════════════════════════════
-#  Coefficients MUST match the export gamut (project-verified: DaVinci
-#  Input=Output=Rec.2020/Linear -> [0.2627, 0.6780, 0.0593] from BT.2020-2;
-#  they are the Y row of the RGB->XYZ matrix, i.e. true luminance weights).
+#  Coefficients must match the working primaries. Linear Rec.709 uses
+#  [0.2126, 0.7152, 0.0722], the Y row of its RGB-to-XYZ matrix.
 
 def rgb_to_luma(rgb: np.ndarray, coeffs: np.ndarray) -> np.ndarray:
     return rgb[:, :, 0] * coeffs[0] + rgb[:, :, 1] * coeffs[1] + rgb[:, :, 2] * coeffs[2]
@@ -320,6 +339,12 @@ def process_sequence(args, cfg):
     W, H = cam["width"], cam["height"]
     coeffs = np.asarray(cam["luma_coeffs"], dtype=np.float32)
     transfer = cam.get("input_transfer", "linear")
+    if transfer != "linear":
+        raise ValueError(
+            "The aligned workflow expects SDR N-RAW to be linearized in DaVinci "
+            "before export. Set camera.input_transfer='linear' and provide linear "
+            "Rec.709 uint16 TIFFs; Python will not linearize the signal twice.")
+    working_primaries = cam["working_primaries"]
     calib = load_calibration(Path(cfg["paths"]["calibration_dir"]), cfg)
 
     tiffs = sorted(set(list(in_dir.glob("*.tif")) + list(in_dir.glob("*.tiff"))))
@@ -332,9 +357,9 @@ def process_sequence(args, cfg):
     print(f"  RGB (SAM3) -> {out_rgb if out_rgb else '(disabled — no --output-rgb)'}")
     print(f"  transfer={transfer}  stab={'Y' if pp['stabilize'] else '-'}  "
           f"denoise={pp['denoise']}(Y-branch only)")
-    print(f"  reminder: #TIFFs ≈ real_seconds x {cam['fps_original']} (capture fps, "
-          f"real_seconds = đồng hồ thật của cảnh quay — KHÔNG phải theo timeline đã "
-          f"relabel/kéo dài), NOT x {cam['fps_export']}")
+    print(f"  primaries={working_primaries} -> srgb for annotation images")
+    print(f"  reminder: TIFF count should be approximately real_seconds x "
+          f"{cam['fps_original']} (capture fps), not x {cam['fps_export']}")
     print(f"{'━'*64}\n")
 
     # Undistort maps: need the real frame size -> peek at frame 0 once.
@@ -364,7 +389,7 @@ def process_sequence(args, cfg):
 
         # ── branch split: geometry is FROZEN above this line ──
         if out_rgb is not None:                              # N7a SAM3 branch
-            srgb = encode_srgb_u8(rgb)
+            srgb = linear_working_to_srgb_u8(rgb, working_primaries)
             # 8-bit TIFF, not PNG/JPG: SAM3's own loader (io_utils.py IMAGE_EXTS) accepts
             # .tiff natively via PIL, so this is the SAME container family as the rest of
             # the pipeline (calibrate.py/preprocess.py/run_v2e.py/run_dvsvolt.py all speak
@@ -399,6 +424,21 @@ def process_sequence(args, cfg):
         vp = str(out_y / "_verify_frame0.png")
         save_verify(first_raw, first_Y, first_srgb, vp)
         print(f"[verify] -> {vp}")
+
+    metadata = {
+        "input_transfer": transfer,
+        "source_primaries": working_primaries,
+        "annotation_destination_primaries": "srgb",
+        "annotation_transfer": "IEC 61966-2-1 sRGB",
+        "capture_transfer": "SDR (not N-Log)",
+        "linearization_owner": "DaVinci Resolve",
+        "working_signal": "already-linear Rec.709 RGB, 16-bit TIFF scale",
+        "applied_corrections": calib.get("applied_corrections", []),
+        "geometry": {"width": int(W), "height": int(H), "shared_once": True},
+    }
+    (out_y / "preprocess_metadata.json").write_text(json.dumps(metadata, indent=2))
+    if out_rgb is not None:
+        (out_rgb / "preprocess_metadata.json").write_text(json.dumps(metadata, indent=2))
 
     print(f"\n✓ Done. {len(tiffs)} frames in {time.time()-t0:.1f}s")
     print(f"  Event branch: python run_v2e.py --input {out_y} --output data/events_v2e/<session>")

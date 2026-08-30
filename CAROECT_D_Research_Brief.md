@@ -3,113 +3,113 @@
 
 ---
 
-## Pitch một câu
+## One-sentence pitch
 
-> Chúng tôi tạo ra large-scale labeled traffic event-camera dataset từ RGB video thông thường, bằng cách simulate event streams với độ chính xác vật lý học — không cần event camera thật để thu thập data, không cần con người để label.
+> We create a large-scale labeled traffic event-camera dataset from conventional RGB video through physically grounded event simulation, without requiring a real event camera for primary data collection or manual annotation at dataset scale.
 
 ---
 
-## Bức tranh toàn cảnh — 1 trang
+## One-page overview
 
 ```
-VẤN ĐỀ                     GIẢI PHÁP
+PROBLEM                     SOLUTION
 ─────────────────           ──────────────────────────────────────
-Event cameras tốt           RGB RAW capture (rẻ, dễ)
-  cho traffic sensing   →      ↓ Physics-accurate preprocessing
-Nhưng:                         ↓ v2e / DVS-Voltmeter simulation
-  - Hardware đắt               ↓ DINO + SAM auto-annotation
-  - Annotation khó             ↓ Geometric label transfer
-  - Dataset ít và nhỏ          ↓
+Event cameras suit           SDR N-RAW capture
+  traffic sensing        →      ↓ DaVinci linear Rec.709 export
+But:                             ↓ v2e / DVS-Voltmeter simulation
+  - Hardware is costly          ↓ SAM3 automatic annotation
+  - Annotation is difficult     ↓ Causal geometric label transfer
+  - Datasets are scarce         ↓
                            Labeled synthetic event dataset
                                ↓ Model training (RVT, YOLOv8-event)
                                ↓ Sim2real validation (LUCID EVS)
                            Deployed traffic perception model
 ```
 
-**Key claim của paper:** Nếu RGB preprocessing đúng về mặt physics, synthetic events gần với real events đủ để train models có performance competitive với models trained on real event data.
+**Paper claim to test:** if RGB preprocessing preserves the relevant radiometric, temporal, and geometric properties, synthetic events may be close enough to real events for competitively transferring trained models. This remains an empirical hypothesis, not a presumed result.
 
 ---
 
 ---
 
-# PHẦN 1 — MOTIVATION & PROBLEM
+# PART 1 — MOTIVATION AND PROBLEM
 
-## 1.1 Event Cameras Là Gì và Tại Sao Quan Trọng
+## 1.1 What are event cameras, and why do they matter?
 
-Event camera **không chụp frame**. Thay vào đó, mỗi pixel hoạt động độc lập:
-- Khi log-intensity tại pixel đó thay đổi vượt threshold C → pixel fires một **event** `(x, y, t, polarity)`
-- ON event: sáng lên. OFF event: tối đi
-- Temporal resolution: **microseconds** (camera thường: milliseconds)
-- Dynamic range: **~120 dB** (camera thường: ~60 dB)
-- Zero motion blur do không có exposure time
+An event camera **does not capture conventional frames**. Instead, each pixel operates independently:
+- When the change in log intensity crosses threshold C, the pixel emits an **event** `(x, y, t, polarity)`.
+- An ON event represents an increase; an OFF event represents a decrease.
+- Temporal resolution: **microseconds** rather than conventional frame-camera milliseconds.
+- Event sensors can provide approximately **120 dB** dynamic range, depending on sensor and operating conditions.
+- Asynchronous events avoid conventional frame-exposure motion blur, subject to photoreceptor bandwidth.
 
-Với **traffic monitoring**: xe tốc độ cao không bị blur, hoạt động tốt cả ngày lẫn đêm, latency cực thấp — ideal cho real-time vehicle detection và tracking.
+For **traffic monitoring**, these properties are relevant to fast vehicles, difficult illumination, low latency, real-time detection, and tracking. Actual performance must still be measured.
 
-## 1.2 Vấn Đề: Không Có Data Để Train
+## 1.2 The problem: insufficient labeled data
 
-Deep learning cần labeled data. Với event cameras, đây là bottleneck cực kỳ nghiêm trọng:
+Deep learning requires labeled data. For event cameras, this is a severe bottleneck:
 
-| Vấn đề | Chi tiết |
+| Problem | Detail |
 |--------|---------|
-| Hardware đắt | Event camera tốt: $5,000–$30,000+ mỗi cái |
-| Annotation không thể làm tay | Event stream trông như mớ điểm rời rạc, không ai nhìn vào đó mà vẽ bbox được |
-| Synchronization phức tạp | Cần phần cứng đặc biệt để sync event camera với reference RGB |
-| Dataset công khai cực ít | eTram: vài giờ footage. TUMTraf: vài giờ. Không dataset nào đủ lớn |
-| Diversity thấp | Mỗi dataset chỉ cover 1–2 locations, limited conditions |
+| Expensive hardware | High-quality event-camera systems can cost thousands of dollars per unit. |
+| Manual annotation does not scale | Event streams are sparse asynchronous points, making direct bounding-box annotation impractical at scale. |
+| Complex synchronization | Paired evaluation needs hardware or signal-based synchronization between RGB and event cameras. |
+| Few public datasets | Existing traffic datasets cover limited footage, locations, and conditions. |
+| Low diversity | A small number of locations cannot represent broad deployment conditions. |
 
-**Gap:** Không có large-scale, diverse, automatically-labeled traffic event-camera dataset nào.
+**Gap:** there is no established large-scale, diverse, automatically labeled traffic event-camera dataset with complete radiometric, temporal, geometric, simulator, and split provenance.
 
-## 1.3 Tại Sao Chưa Ai Giải Quyết Được
+## 1.3 Why has this remained difficult?
 
-Các approaches trước đó:
-- **Thu thập thật (eTram, TUMTraf):** Deploy event camera thật → annotation thủ công → không scale
-- **Simple simulation:** Apply basic Gaussian filter lên RGB video → không physically accurate → sim2real gap lớn → model không transfer
+Prior approaches generally follow these paths:
+- **Real collection (eTram, TUMTraf):** deploy event cameras and create annotations; this is valuable but expensive to scale.
+- **Simplified simulation:** process ordinary RGB video without controlling transfer, exposure, geometry, and timing; this can enlarge the sim-to-real gap.
 
-**CAROECT-D** là approach đầu tiên systematic kết hợp: (1) RAW RGB capture để preserve physics, (2) full sensor calibration pipeline, (3) physically-grounded simulation, (4) foundation model auto-annotation, vào một end-to-end scalable system.
-
----
+**CAROECT-D** systematically combines: (1) SDR N-RAW capture with DaVinci linear Rec.709 export, (2) measurement-backed calibration manifests, (3) physically grounded simulation, (4) bidirectional SAM3 automatic annotation, and (5) causal label transfer in a scalable end-to-end system.
 
 ---
 
-# PHẦN 2 — HARDWARE SYSTEM
+---
+
+# PART 2 — HARDWARE SYSTEM
 
 ## 2.1 Camera A — RGB Source (Nikon Z6 III)
 
-**Mục đích:** Thu thập source footage để generate everything else
+**Purpose:** collect source footage from which synthetic event streams and RGB-domain labels are generated.
 
-| Setting | Value | Lý do |
+| Setting | Value | Rationale |
 |---------|-------|-------|
-| Format | NRAW (.NEV) | RAW sensor data, trước mọi camera processing |
-| Framerate | 119.88 fps | Temporal density cao cho event interpolation |
-| ISO | 100–400 | Low noise, high dynamic range |
-| Shutter | 1/250–1/500 | Sharp edges, giảm motion blur |
-| Aperture | f/5.6–f/8 | Large depth of field, stable hyperfocal focus |
-| WB/Exposure | Manual, fixed | Auto changes → fake events |
-| Focus | Manual, locked | Autofocus thay đổi geometry → break calibration |
-| Storage | CFexpress Type B | Đủ nhanh cho NRAW 120fps |
+| Format | 12-bit SDR N-RAW (.NEV), not N-Log | High-bit-depth source decoded and linearized in DaVinci Resolve. |
+| Frame rate | 119.88 fps | Dense source observations for event simulation; no label interpolation. |
+| ISO | 100–400 | Favor low noise and usable source dynamic range when lighting permits. |
+| Shutter | 1/250–1/500 s | Preserve sharp edges and reduce frame-domain motion blur. |
+| Aperture | f/5.6–f/8 | Increase depth of field and support stable manual focus. |
+| WB/exposure | Manual and fixed | Automatic temporal changes can create false event-like transients. |
+| Focus | Manual and locked | Autofocus can change geometry and invalidate calibration assumptions. |
+| Storage | CFexpress Type B | Sustain high-frame-rate N-RAW recording. |
 
-**Lenses dùng:** 20mm f/1.8, 24mm, 28mm — wide để capture cả làn đường
+**Candidate lenses:** 20 mm f/1.8, 24 mm, and 28 mm, selected to cover the roadway. Each camera/lens/focus configuration needs matching calibration provenance.
 
 ## 2.2 Camera B — Event Validation (LUCID Triton2 EVS)
 
-**Mục đích:** Capture real events để validate synthetic events
+**Purpose:** capture real events for paired and cross-domain validation.
 
 - Sensor: Sony IMX636
-- Resolution: 1280×720 (target resolution cho toàn bộ pipeline)
-- **Không** dùng để collect main dataset — chỉ dùng cho sim2real evaluation
-- Deploy cùng scene với Camera A → so sánh synthetic vs real events
+- Resolution: 1280×720, also used as the native event-dataset grid.
+- It is not the primary large-scale collection camera; it provides real-event validation.
+- For paired evaluation it observes the same scene as Camera A with an explicit synchronization estimate.
 
-## 2.3 Hyperfocal Distance — Tại Sao Quan Trọng
+## 2.3 Hyperfocal distance and stable focus
 
-Đặt focus tại hyperfocal distance H → mọi thứ từ H/2 đến infinity acceptably sharp. Ví dụ: nếu H = 10m → 5m đến infinity đều sharp. Với roadside traffic, xe ở các khoảng cách khác nhau → cần depth of field này.
+Focusing near hyperfocal distance H makes the scene acceptably sharp from approximately H/2 to infinity under the usual approximation. For example, H = 10 m suggests a nominal range from about 5 m to infinity. Roadside targets span many distances, so this depth of field is useful.
 
-Fixed focus sau đó → calibration consistency, không thay đổi lens geometry giữa các shots.
-
----
+Focus is then locked to maintain calibration consistency and avoid lens-geometry changes between recordings.
 
 ---
 
-# PHẦN 3 — DATASET GENERATION PIPELINE
+---
+
+# PART 3 — DATASET GENERATION PIPELINE
 
 ## 3.1 Overview Pipeline
 
@@ -117,21 +117,21 @@ Fixed focus sau đó → calibration consistency, không thay đổi lens geomet
 .NEV files
   │
   ▼ [DaVinci Resolve]
-  ├─ Decode NRAW (chỉ DaVinci đọc được proprietary format)
-  ├─ Rough WB + lens profile
-  └─ Export 16-bit TIFF @ 119.88fps, 1280×720
+  ├─ Decode 12-bit SDR N-RAW in DaVinci Resolve (not N-Log)
+  ├─ Apply a fixed documented SDR-to-linear Rec.709 transform
+  └─ Export already-linear RGB uint16 TIFF at native 119.88 fps
   │
   ▼ [Python / OpenCV]
   ├─ Load + validate uint16
   ├─ Dark frame subtraction        ← sensor thermal noise
   ├─ Flat field correction         ← vignetting + pixel non-uniformity
   ├─ White balance (gray card)     ← illuminant correction
-  ├─ Linearization (γ⁻¹ = 2.2)  ← [CRITICAL] restore physical intensity
-  ├─ RGB → Luminance Y (BT.709)  ← event cameras monochrome
+  ├─ Assert input_transfer=linear        ← prevent double linearization
+  ├─ RGB → luma Y (Rec.709)       ← event cameras are monochrome
   ├─ Undistort (K, D)             ← geometric accuracy for labels
   ├─ Gentle denoise (σ≤1.0)       ← optional
-  ├─ Resize 1280×720              ← match event camera resolution
-  └─ Stabilization (optical flow) ← remove tripod vibration
+  ├─ Preserve native 1280×720      ← explicit letterbox only if requested
+  └─ Optional stabilization        ← disabled by default and shared by branches
   │
   ▼ [v2e / DVS-Voltmeter]
   ├─ Temporal upsampling (SuperSloMo)
@@ -140,40 +140,40 @@ Fixed focus sau đó → calibration consistency, không thay đổi lens geomet
   └─ Noise models (shot, hot pixels, leak, threshold variation)
   │
   ▼ Event representations
-  ├─ Event frames (2D, 10/20/50ms windows)
+  ├─ Fixed-count images (8.34/16.7/33.3/50.0 ms causal windows)
   ├─ Voxel grids (H × W × T bins)
   └─ Time surfaces (recency map)
 ```
 
-## 3.2 Tại Sao Mỗi Preprocessing Step Bắt Buộc
+## 3.2 Why each preprocessing step exists
 
-### Dark Frame — Loại bỏ electronic baseline
+### Dark residual — electronic baseline correction
 
-Sensor luôn có non-zero output kể cả không có ánh sáng (thermal noise + Fixed Pattern Noise). Nếu không subtract: `log(signal + noise)` thay vì `log(signal)` → fake events ở dark regions.
+A sensor may have non-zero output in darkness because of thermal and fixed-pattern components. If that residual is present, `log(signal + residual)` can alter threshold crossings in dark regions.
 
-*Cách làm:* Chụp 10–20 frames lens cap → average → subtract khỏi mọi frame.
+*Acquisition:* record multiple lens-cap frames under matching settings, estimate and validate the residual artifact, and enable correction only when the calibration manifest marks it valid.
 
-### Flat Field — Đồng đều brightness spatial
+### Flat field — spatial response correction
 
-Lens truyền ít ánh sáng hơn ở corners (vignetting). Mỗi pixel có sensitivity khác nhau. Không sửa → spatial brightness gradient → fake position-dependent events khi xe đi từ center ra edge frame.
+Lens vignetting and pixel-response non-uniformity can create a spatial gradient. Object motion across that gradient can then generate position-dependent synthetic events.
 
-*Cách làm:* Chụp uniform scene (tường trắng) → gain_map = mean/flat → multiply.
+*Acquisition:* record a homogeneous non-zero field, derive a bounded gain map, validate it, and leave correction disabled until the artifact is valid.
 
-### Linearization — Bước quan trọng nhất
+### Transfer ownership — DaVinci linearization, never twice
 
-Camera lưu: `pixel ≈ (physical_light)^(1/2.2)` do gamma compression. Event cameras phản hồi với linear physical light. Nếu không undo gamma:
-- Vùng tối bị stretched → threshold crossing sai → wrong event rate trong shadows
-- Vùng sáng bị compressed → miss events trong bright areas
+Capture uses SDR N-RAW, not N-Log. DaVinci Resolve removes the declared SDR encoding and exports linear Rec.709 before Python. Feeding encoded SDR directly would mis-scale log contrast; applying inverse gamma again in Python would also be wrong:
+- Encoded SDR input would distort shadow-region threshold crossings.
+- Double linearization would distort both dark and bright values and invalidate simulator calibration.
 
-*Công thức:* `linear = (stored / 65535)^2.2 × 65535`
+*Implementation rule:* `camera.input_transfer: linear`; the Python transform is an identity because DaVinci owns linearization.
 
 ### RGB → Luminance Y (BT.709)
 
-Event cameras không có màu sắc. Phải collapse 3 channels → 1. Simple average (R+G+B)/3 sai vì Green chiếm ~72% luminance perception. BT.709: `Y = 0.2126R + 0.7152G + 0.0722B` — calibrated cho Rec.709 color space (đúng với Nikon Z6 III).
+Event simulation is monochrome. The already-linear Rec.709 channels are reduced with `Y = 0.2126R + 0.7152G + 0.0722B`; the arithmetic channel mean is not used.
 
-### 16-bit TIFF (không phải 8-bit)
+### 16-bit TIFF rather than an 8-bit delivery image
 
-Event simulation dựa trên differences nhỏ trong log-intensity. 8-bit shadow regions: values 3, 4, 5 — difference của 1 có thể round xuống 0 → event lost. 16-bit: same region values 800, 850, 900 — difference 50 preserved. Direct impact lên event quality ở nighttime footage.
+Event simulation depends on small log-intensity differences. A high-bit-depth linear working export preserves more numerical precision than an 8-bit delivery image, especially in dark regions. TIFF bit depth alone does not imply that SDR capture matches the event sensor's dynamic range.
 
 ## 3.3 v2e vs DVS-Voltmeter
 
@@ -185,58 +185,58 @@ Event simulation dựa trên differences nhỏ trong log-intensity. 8-bit shadow
 | Use case | Baseline, high throughput | Higher-fidelity simulation, ablation |
 | Output | (x,y,t,polarity) .h5 | (x,y,t,polarity) .h5 |
 
-Paper sẽ compare model performance khi train trên v2e-generated vs DVS-Voltmeter-generated events.
+The paper will compare downstream performance for isolated v2e and DVS-Voltmeter conditions.
 
 ## 3.4 Automatic Annotation Pipeline
 
-**Trên RGB domain:**
-1. **DINO** (vision foundation model) → detect cars, trucks, motorcycles, pedestrians, cyclists
-2. **SAM** (Segment Anything) → pixel-level instance segmentation masks
-3. **ByteTrack / SORT** → track across frames → consistent tracking IDs
+**In the RGB domain:**
+1. **SAM3** receives a text prompt for the target traffic-participant class.
+2. Independent forward and backward sessions preserve both directional track artifacts.
+3. Same-class trajectories are merged deterministically using overlap, IoU, continuity, confidence, and a narrow receding-object tie-break.
 
-**Transfer sang event domain:**
-- Dùng undistortion parameters (K, D) và resize factor
-- Map (x₁,y₁,x₂,y₂) coordinates từ RGB space → event frame space
-- Masks được warped accordingly
+**Transfer to the event domain:**
+- Use the shared geometric grid established before the RGB/event branch split.
+- At exact observed time `t_k`, copy frame-k geometry to events in `[t_k-window_us, t_k)`.
+- Do not use future labels or interpolation in the normal path; real pairs require explicit synchronization provenance.
 
-**Kết quả:** Zero-human-annotation labeled dataset at scale.
-
----
+**Result:** a scalable automatically labeled dataset with auditable timing, geometry, and simulator provenance.
 
 ---
 
-# PHẦN 4 — MODEL TRAINING
+---
 
-## 4.1 Kiến Trúc Model
+# PART 4 — MODEL TRAINING
+
+## 4.1 Model architecture
 
 ### Baseline: Frame-based Detection
-- **Input:** Event frames (single-channel 2D images từ event accumulation)
-- **Model:** YOLOv8 adapted cho single-channel input (thay RGB 3ch → event frame 1ch)
-- **Lý do:** Familiar, fast iteration, strong baseline cho comparison
+- **Input:** fixed-count ON/OFF event images from causal accumulation windows.
+- **Model:** an Ultralytics YOLO event baseline; HSV color augmentation is disabled.
+- **Rationale:** familiar tooling and fast iteration provide a reproducible baseline.
 
 ### State-of-the-art: RVT (Recurrent Vision Transformer)
 - **Input:** Voxel grids (H × W × T)
 - **Architecture:** Recurrent attention mechanism captures temporal event dynamics
-- **Performance:** Current SOTA trên standard event-detection benchmarks (Gen1, Gen4)
-- **Lý do chọn:** Traffic events có strong temporal structure — recurrent architecture khai thác điều này tốt hơn frame-by-frame approaches
+- **Performance:** a candidate specialized comparison on standard event-detection benchmarks.
+- **Rationale:** traffic events have strong temporal structure that a recurrent architecture may exploit better than independent frames. This remains a proposed comparison.
 
 ### Tracking Module
-- ByteTrack hoặc BoT-SORT integrated với detection output
-- Event-specific: time surfaces có thể guide association khi detection confidence thấp
+- ByteTrack or BoT-SORT can be applied to detector output.
+- Event-specific time surfaces may support association when detection confidence is low.
 
-## 4.2 Event Representations và Ảnh Hưởng Đến Architecture
+## 4.2 Event representations and architectural implications
 
-| Representation | Cách tạo | Input shape | Phù hợp với |
+| Representation | Construction | Input shape | Typical consumer |
 |---------------|---------|------------|-------------|
-| Event frames | Accumulate events trong T ms | [B, 1, H, W] | CNN-based detectors |
-| Voxel grids | T time bins, polarity-weighted | [B, T, H, W] | RVT, 3D conv |
-| Time surfaces | Timestamp của event gần nhất | [B, 2, H, W] | Auxiliary input |
+| Fixed-count ON/OFF image | Accumulate causal events and clip with one shared train-derived scale | [B, 3, H, W] | 2D detector |
+| Voxel grid | Polarity-weighted temporal bins | [B, T, H, W] | RVT / temporal convolution |
+| Time surface | Most recent event time by polarity | [B, 2, H, W] | Auxiliary input |
 
-**Trade-off:** Time window T của event frames:
-- T nhỏ (10ms): nhiều frames, ít events per frame, high temporal resolution
-- T lớn (50ms): ít frames, dense events, thấy rõ object shape hơn nhưng mất temporal info
+**Trade-off for detector window T:**
+- 8.34 ms: fewer events and high temporal localization.
+- 50.0 ms: denser object shape but more temporal integration. Standard intermediate windows are 16.7 and 33.3 ms.
 
-## 4.3 Dataset Split và Structure
+## 4.3 Dataset split and structure
 
 ```
 CAROECT-D/
@@ -246,14 +246,14 @@ CAROECT-D/
     site03/   ← suburban road, nighttime
     ...
   Events_v2e/
-    site01/   ← synthetic events từ site01
+    site01/   ← synthetic events from site01
   Events_DVSVolt/
     site01/
   Labels/
     site01/   ← COCO-format JSON annotations
 ```
 
-**Split:** Theo site (không theo frame). Frames từ cùng site có temporal correlation cao — split theo frame → data leakage, validation không meaningful.
+**Split by site, never by frame.** Frames from one site are temporally and visually correlated; frame-level random splitting would leak scene identity and undermine validation.
 
 ## 4.4 Augmentation Strategies
 
@@ -262,52 +262,52 @@ CAROECT-D/
 **Event-specific:**
 - **Event drop:** Random remove X% events → simulate sensor packet loss, sensor aging
 - **Temporal jitter:** Scale timestamps → simulate different motion speeds
-- **Polarity noise:** Random flip polarities → simulate threshold variation giữa pixels
+- **Polarity noise:** Randomly flip polarities to simulate per-pixel threshold variation.
 - **Spatial noise:** Add random spurious events → simulate hot pixel behavior
 - **Rate scaling:** Change event density → simulate different scene dynamics
 
-*Lý do event-specific augmentation quan trọng:* Tạo diversity trong training data mà model sẽ gặp khi deploy với real camera có noise characteristics khác.
+*Why event-specific augmentation matters:* it can expose the model to controlled sensor-like variation. These operations are experimental and must be recorded rather than silently baked into the canonical dataset.
 
 ## 4.5 Training Setup
 
 | Hyperparameter | Value |
 |---------------|-------|
 | Optimizer | AdamW + weight decay 1e-4 |
-| LR schedule | Cosine annealing với warmup |
+| LR schedule | Cosine annealing with warmup |
 | Loss (YOLO-style) | Box regression + classification + objectness |
 | Loss (DETR-style) | Hungarian matching |
-| Batch size | 8–32 (depends on GPU memory và representation) |
-| Hardware | Multi-GPU (voxel grids tốn memory) |
+| Batch size | 8–32, depending on GPU memory and representation |
+| Hardware | Declared per run; voxel grids can require substantial memory |
 
-**Label format:** COCO JSON với event-specific metadata (timestamp range per annotation, event density per instance).
-
----
+**Label provenance:** every dataset root records the causal timestamp range, event indices, geometry, simulator condition, split, and shared representation scale. COCO export, when used, must preserve this metadata.
 
 ---
 
-# PHẦN 5 — EVALUATION STRATEGY
+---
+
+# PART 5 — EVALUATION STRATEGY
 
 ## 5.1 Internal Validation: Synthetic vs Real Event Quality
 
-**Câu hỏi:** Synthetic events từ pipeline có gần với real events từ LUCID EVS không?
+**Question:** how closely do pipeline-generated events match real LUCID EVS events under controlled observations?
 
 **Protocol:**
-1. Đặt LUCID EVS cạnh Nikon Z6 III, capture cùng scene
-2. Generate synthetic events từ RGB
-3. So sánh statistical distributions
+1. Place the LUCID EVS and Nikon systems on the same observable scene.
+2. Estimate RGB/event offset from a visible synchronization signal and store method, residual, and confidence.
+3. Generate synthetic events and compare exact metric vectors under matched support.
 
 **Metrics:**
 - Event rate (events/pixel/second): synthetic vs real
 - Polarity ratio (ON/OFF balance)
 - Spatial density maps
 - Noise floor estimation
-- Threshold C estimation từ real events → so sánh với simulation parameters
+- Estimate contrast threshold C from controlled real observations and compare it with declared simulator parameters.
 
 ## 5.2 Detection Performance
 
 **Primary metrics:**
 - **mAP@50:** Standard threshold, overall detection accuracy
-- **mAP@50:95:** Stricter, COCO-style, đánh giá localization quality
+- **mAP@50:95:** stricter COCO-style localization assessment.
 - **AP per class:** Cars, trucks, motorcycles, pedestrians, cyclists
 - **FPS:** Real-time capability assessment
 
@@ -325,9 +325,9 @@ CAROECT-D/
 - **IDF1:** Identity F1 — how well identities maintained over time
 - **MOTP:** Trajectory precision
 
-## 5.4 Sim2Real Validation — Key Experiment của Paper
+## 5.4 Sim-to-real validation — the paper's key experiment
 
-**Câu hỏi:** Model train trên CAROECT-D synthetic có generalize sang real event data không?
+**Question:** does a model trained on CAROECT-D synthetic events generalize to real event data?
 
 ```
 Train: CAROECT-D synthetic events
@@ -339,10 +339,10 @@ Train: CAROECT-D synthetic events
 Success: performance gap < 5–10% mAP → synthetic training viable
 ```
 
-**Nếu gap nhỏ:** Paper's core claim validated — preprocessing quality is sufficient for sim2real transfer.
-**Nếu gap lớn:** Cần ablate preprocessing steps để tìm root cause.
+**If the gap is small:** the result supports the core claim under the declared protocol.
+**If the gap is large:** controlled ablations should isolate radiometry, timing, geometry, simulator, representation, and scene-domain causes.
 
-## 5.5 Ablation Studies — Chứng Minh Từng Bước Có Impact
+## 5.5 Ablation studies — measure each component's effect
 
 ### Ablation 1: Preprocessing Quality Impact
 
@@ -353,7 +353,7 @@ Success: performance gap < 5–10% mAP → synthetic training viable
 | No dark+flat | ✗ | ✗ | ✓ | ✓ | Drop: spatial noise artifacts |
 | Minimal (raw) | ✗ | ✗ | ✗ | ✗ | Worst: all artifacts present |
 
-*Mục tiêu:* Quantitatively chứng minh rằng physics-accurate preprocessing directly improves downstream model performance. Đây là một trong những novel contributions của paper.
+*Objective:* quantify whether each measurement-backed preprocessing choice improves event fidelity and downstream performance. Unavailable calibration data is not fabricated to fill an ablation cell.
 
 ### Ablation 2: Event Representation
 
@@ -371,49 +371,49 @@ Success: performance gap < 5–10% mAP → synthetic training viable
 | v2e | | |
 | DVS-Voltmeter | | |
 
-*Nếu DVS-Voltmeter → higher mAP:* Justifies using more expensive simulation. *Nếu similar:* v2e sufficient, simpler pipeline.
+*If DVS-Voltmeter improves mAP:* the added complexity may be justified. *If results are similar:* the simpler v2e baseline is preferable.
 
 ---
 
 ---
 
-# PHẦN 6 — RELATED WORK & POSITIONING
+# PART 6 — RELATED WORK AND POSITIONING
 
-## 6.1 Các Papers Core Phải Biết
+## 6.1 Core papers and datasets
 
-### v2e — Foundation của simulation
+### v2e — simulation foundation
 
 *Yang et al., CVPR 2021*
 
-Event generation từ video frames bằng log-intensity threshold model:
-- SuperSloMo temporal upsampling → high temporal resolution
-- `L = log(Y)`, event khi `|ΔL| > C`
+Event generation from video frames using a log-intensity threshold model:
+- Optional temporal upsampling for higher synthetic sampling density.
+- `L = log(Y)` with an event when `|ΔL| > C`.
 - Noise: shot noise, threshold variation, hot pixels, leak events
 - Output: (x,y,t,polarity) stream
 
-**Relation to CAROECT-D:** v2e là primary event simulator. Paper cite v2e extensively. Linearization step trong preprocessing pipeline exist specifically để feed đúng format vào v2e.
+**Relation to CAROECT-D:** v2e is the named primary baseline. DaVinci supplies already-linear Rec.709 input so Python can compute matching luminance without another transfer conversion.
 
 ### DVS-Voltmeter — Advanced simulation
 
 *Lin et al.*
 
-Model voltage dynamics của photodiode circuit (Brownian motion with drift), không chỉ simple threshold. Captures phenomena v2e misses: temporal clustering, refractory period, voltage leak.
+This model describes photodiode-circuit voltage dynamics as Brownian motion with drift rather than only a deterministic threshold, capturing temporal clustering, refractory behavior, and leakage.
 
-**Relation:** Alternative simulator. CAROECT-D compare v2e vs DVS-Voltmeter generated data.
+**Relation:** an alternative simulator compared with v2e under disjoint condition roots.
 
 ### eTram — Real event traffic dataset
 
-Urban tram tracking với event camera. Ground-truth tracking annotations. Small scale nhưng real.
+Urban tram tracking with real event-camera observations and ground-truth tracking annotations.
 
-**Relation:** Primary benchmark cho sim2real evaluation. Test model trained on CAROECT-D → evaluate on eTram → measure generalization.
+**Relation:** a possible real-event benchmark for evaluating CAROECT-D generalization, subject to compatible classes and protocols.
 
 ### TUMTraf Event — Multimodal traffic dataset
 
 RGB + event camera, roadside, TU Munich. Multiple scene types, multiple object classes.
 
-**Relation:** Cross-domain validation. Different country, different camera setup → tests robustness của sim2real.
+**Relation:** cross-domain validation under a different country, scene, and acquisition setup.
 
-## 6.2 CAROECT-D Gap Trong Literature
+## 6.2 CAROECT-D gap in the literature
 
 | | eTram | TUMTraf | Prophesee Gen1/4 | **CAROECT-D** |
 |-|-------|---------|------------------|----------------|
@@ -427,20 +427,20 @@ RGB + event camera, roadside, TU Munich. Multiple scene types, multiple object c
 
 ---
 
-# PHẦN 7 — RESEARCH CONTRIBUTIONS
+# PART 7 — RESEARCH CONTRIBUTIONS
 
 ## Contribution 1: Physics-Accurate Preprocessing Pipeline
 
-**Novel:** Systematic methodology để convert RGB RAW → event-simulation-ready linear luminance, với full sensor calibration (dark frame, flat field, white balance, geometric undistortion).
+**Proposed novelty:** a systematic SDR N-RAW → DaVinci-linear Rec.709 → event-simulation-ready luminance workflow with calibration manifests, optional corrections, and shared geometry.
 
-**Chứng minh bởi:** Ablation studies showing preprocessing quality directly correlates with event simulation fidelity và downstream model performance. Không paper nào trước quantify điều này.
+**Evidence:** controlled ablations relating each valid preprocessing choice to event metrics and downstream performance. This is a claim to test rather than assume.
 
 ## Contribution 2: CAROECT-D Dataset
 
 Large-scale, diverse, automatically-labeled roadside traffic event dataset:
 - Multiple sites, multiple lighting conditions, multiple weather conditions
 - Full annotations: bounding boxes, instance masks, tracking IDs
-- Both v2e và DVS-Voltmeter variants
+- Both v2e and DVS-Voltmeter variants, with default and calibrated conditions isolated.
 
 ## Contribution 3: Zero-Annotation Pipeline
 
@@ -448,53 +448,53 @@ End-to-end automatic annotation: DINO + SAM (RGB detection) → ByteTrack (RGB t
 
 ## Contribution 4: Sim2Real Validation
 
-Quantitative evidence rằng CAROECT-D-trained models generalize effectively đến real event camera data. Establishes synthetic event training as viable alternative cho event-camera traffic perception — điều chưa được chứng minh ở traffic domain.
+Quantitative tests determine whether CAROECT-D-trained models generalize to real event-camera data. Positive results would support synthetic training as an alternative for traffic perception; negative or mixed results remain informative.
 
 ---
 
 ---
 
-# PHẦN 8 — Q&A PREPARATION
+# PART 8 — Q&A PREPARATION
 
-**Q: Tại sao không chỉ dùng event camera thật?**
+**Q: Why not use only real event cameras?**
 
 A: Cost (hardware $5k–30k), annotation impossibility at scale, limited location flexibility. CAROECT-D scales to any RGB footage — historical traffic footage, multiple cameras simultaneously, diverse worldwide locations — at marginal cost. Real event cameras remain as validation tools, not as primary data collection.
 
 ---
 
-**Q: Sim2real gap có lớn không? Làm sao biết synthetic đủ tốt?**
+**Q: How large is the sim-to-real gap, and how do we know the synthetic data is good enough?**
 
-A: Validated bằng hai approaches: (1) Statistical comparison với real LUCID EVS captures cùng scene — event rate, polarity ratio, density maps. (2) Downstream task performance — nếu model trained on synthetic achieves competitive mAP on real event benchmarks, pipeline is validated. Ablation studies quantify contribution của từng preprocessing step đến closing the gap.
-
----
-
-**Q: DINO + SAM có accurate đủ để làm training labels không?**
-
-A: Foundation models achieve >90% mAP trên standard benchmarks. Theo noise-learning literature, high-volume noisy labels often outperform low-volume clean labels cho training. Chúng tôi filter bằng confidence threshold và temporal consistency (tracking) để reduce noise.
+A: The gap is measured through (1) controlled comparison of exact synthetic and real metric vectors and (2) downstream zero-shot performance on real event benchmarks. Synchronization, metric definitions, weights, simulator condition, and confidence are stored; ablations attribute changes to pipeline components.
 
 ---
 
-**Q: Tại sao cần RAW? Không thể dùng H.264 video thông thường?**
+**Q: Is SAM3 accurate enough to produce training labels?**
 
-A: Consumer video apply: gamma compression (irreversible), aggressive noise reduction (destroys sensor physics), lossy compression (corrupts pixel values), potential dynamic WB changes (temporal brightness shifts → fake events). RAW preserves sensor data trước mọi processing. Linearization pipeline chỉ hoạt động tốt với RAW input.
-
----
-
-**Q: v2e đủ chưa hay cần DVS-Voltmeter?**
-
-A: v2e là good baseline và significantly faster. DVS-Voltmeter physically more accurate, especially cho low-contrast và static-rich scenes. Paper compare cả hai — nếu DVS-Voltmeter cho better sim2real performance, additional complexity justified. Nếu similar, v2e sufficient.
+A: Accuracy must be measured on a manually reviewed sample from the actual traffic domain. The pipeline reconciles independent directional tracks with temporal overlap, IoU, continuity, confidence, and a narrowly defined receding-object tie-break; external benchmark claims alone are insufficient.
 
 ---
 
-**Q: Tại sao 16-bit TIFF? Không thể dùng PNG hay JPEG?**
+**Q: Why use SDR N-RAW rather than ordinary H.264 delivery video?**
 
-A: JPEG: lossy compression distorts pixel values → wrong physics. PNG: typically 8-bit (256 levels). Event simulation cần precision ở dark regions — 16-bit (65535 levels) preserves subtle intensity differences mà 8-bit rounds away. Impact đặc biệt rõ ở nighttime footage.
+A: Delivery video may contain a transfer function, temporal denoising, sharpening, chroma subsampling, lossy compression, and automatic white-balance/exposure changes. CAROECT-D records SDR N-RAW—not N-Log—and performs a fixed SDR-to-linear Rec.709 transform in DaVinci before Python. The pipeline does not claim that this SDR workflow is untouched photosite data.
 
 ---
 
-**Q: Làm sao scale lên nhiều sites? Pipeline bao lâu mỗi hour of footage?**
+**Q: Is v2e sufficient, or is DVS-Voltmeter necessary?**
 
-A: DaVinci export: real-time hoặc 2–4x faster. Python preprocessing: parallelizable theo frame. Event simulation: v2e ~ 5–10x real-time trên GPU. Total: roughly 30–60 min processing cho 1 hour footage tại 120fps. Annotation: DINO+SAM chạy parallel, không phải bottleneck.
+A: v2e is the high-throughput named baseline. DVS-Voltmeter provides a more detailed alternative model. Measurements decide whether its added complexity improves real-event transfer; similar results would favor v2e.
+
+---
+
+**Q: Why 16-bit TIFF rather than PNG or JPEG?**
+
+A: TIFF is used as a high-bit-depth lossless container for the already-linear working signal. JPEG is lossy. Common 8-bit PNG has only 256 code values; true 16-bit linear PNG could preserve similar values but would still require transfer and reader validation.
+
+---
+
+**Q: How does the pipeline scale across sites, and how long does one hour take?**
+
+A: Decode, preprocessing, annotation, and simulation can be separated and parallelized where state constraints permit. Runtime depends on source cadence, simulator, GPU, prompts, and storage. Earlier speed figures are planning hypotheses; the paper should report measured throughput on declared hardware.
 
 ---
 
@@ -502,16 +502,16 @@ A: DaVinci export: real-time hoặc 2–4x faster. Python preprocessing: paralle
 
 # GLOSSARY — Quick Reference
 
-| Term | Định nghĩa |
+| Term | Definition |
 |------|-----------|
-| **Event camera / DVS** | Camera fires (x,y,t,polarity) events thay vì frames |
-| **ON / OFF event** | ON = pixel sáng lên vượt threshold, OFF = tối đi |
-| **Threshold C** | Min log-intensity change để trigger event (0.2–0.5 typical) |
+| **Event camera / DVS** | A sensor that emits `(x,y,t,polarity)` events rather than conventional frames. |
+| **ON / OFF event** | ON represents a sufficient log-intensity increase; OFF represents a decrease. |
+| **Threshold C** | Minimum log-intensity change needed to trigger an event under a threshold model. |
 | **Log-intensity** | `L = log(I)` — event cameras respond to this, not linear I |
 | **Linearization** | Undo gamma: `linear = compressed^2.2` |
 | **BT.709 luminance** | `Y = 0.2126R + 0.7152G + 0.0722B` |
-| **Dark frame** | Lens cap photo → sensor noise baseline |
-| **Flat field** | Uniform scene photo → vignetting + pixel non-uniformity map |
+| **Dark residual** | Sensor output measured under darkness for optional baseline correction. |
+| **Flat field** | Homogeneous non-zero exposure used to estimate spatial response. |
 | **NRAW / .NEV** | Nikon proprietary RAW video format |
 | **K, D** | Camera intrinsic matrix + distortion coefficients |
 | **v2e** | Video-to-Events: log-intensity threshold event simulator |
@@ -522,21 +522,21 @@ A: DaVinci export: real-time hoặc 2–4x faster. Python preprocessing: paralle
 | **RVT** | Recurrent Vision Transformer — SOTA event-based detector |
 | **mAP** | Mean Average Precision — detection accuracy metric |
 | **HOTA** | Higher Order Tracking Accuracy — primary tracking metric |
-| **Sim2real** | Generalization từ synthetic training đến real deployment |
-| **DINO** | Vision foundation model cho object detection |
+| **Sim-to-real** | Generalization from synthetic training to real deployment data. |
+| **SAM3** | Promptable segmentation/tracking model used for RGB-domain labels. |
 | **SAM** | Segment Anything Model — pixel-level segmentation |
 | **ByteTrack** | SOTA multi-object tracker |
-| **Hyperfocal distance** | Focus point cho max depth of field: H/2 đến ∞ sharp |
-| **CFexpress Type B** | Storage card format đủ nhanh cho NRAW 120fps |
-| **IMX636** | Sony sensor trong LUCID Triton2 EVS event camera |
+| **Hyperfocal distance** | Focus distance intended to maximize the acceptably sharp depth range. |
+| **CFexpress Type B** | High-throughput storage-card format used by the source camera. |
+| **IMX636** | Sony sensor used in the LUCID Triton2 EVS reference camera. |
 
 ---
 
 ---
 
-# TIMELINE — Presentation Flow (20–25 phút)
+# TIMELINE — Presentation Flow (20–25 minutes)
 
-| Phần | Nội dung | Thời gian |
+| Part | Content | Time |
 |------|---------|-----------|
 | 1 | Pitch + Motivation (event cameras + problem) | 3 min |
 | 2 | Core idea + system overview | 2 min |
@@ -551,5 +551,5 @@ A: DaVinci export: real-time hoặc 2–4x faster. Python preprocessing: paralle
 
 ---
 
-*Brief này cover toàn bộ scope của CAROECT-D từ motivation → hardware → preprocessing → training → evaluation → contribution.*
-*Version: 1.0 — Prepared for internal research presentation*
+*This brief preserves the full CAROECT-D scope from motivation through hardware, preprocessing, simulation, annotation, training, evaluation, and contributions.*
+*Version 1.1 — aligned English draft prepared for internal research presentation.*

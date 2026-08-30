@@ -1,55 +1,41 @@
 #!/usr/bin/env python3
 """
-CAROECT-D — DVS-Voltmeter driver (16-bit path, KHÔNG sửa source repo)
-=====================================================================
+CAROECT-D DVS-Voltmeter driver with a high-precision input path.
 
-WHY THIS FILE EXISTS
+Why this file exists
 --------------------
-main.py gốc của DVS-Voltmeter đọc ảnh bằng cv2.IMREAD_GRAYSCALE → ép về
-8-bit, giết dynamic range 16-bit linear của preprocess. File này THAY THẾ
-main.py của nó (chứ không sửa): tự load 16-bit, gọi thẳng class simulator
-trong src/simulator.py. Physics (mô hình Brownian-motion-with-drift, tham số
-k1..k6) giữ nguyên 100% → paper cite "DVS-Voltmeter [Lin et al. ECCV 2022]".
+The upstream command-line program decodes grayscale images as uint8. Library
+mode instead loads linear uint16 TIFFs, divides by 257 into the model's expected
+0..255 DN scale without rounding, and calls the published Brownian-motion-with-
+drift simulator. Its physics and k1..k6 implementation remain unmodified.
 
-2 MODES
--------
-  --mode lib  (DEFAULT)  16-bit precision + seed được (reproducible).
-                         API của repo là research-code không document —
-                         driver tự dò class/method (VERIFY-2/3); nếu dò
-                         fail → lỗi to kèm lệnh để m gửi t signature.
-  --mode cli  (FALLBACK) chạy main.py GỐC qua subprocess trên PNG 8-bit
-                         + info.txt đúng format của nó. Chắc chắn chạy,
-                         nhưng 8-bit và KHÔNG seed được (main gốc không
-                         có seed — xem notes).
+Modes
+-----
+lib (default) preserves fractional precision, seeds NumPy/Torch, and discovers
+the research code's constructor/method signatures with fail-loud diagnostics.
+cli is a compatibility fallback through the original main.py and 8-bit PNG;
+it intentionally loses sub-8-bit precision and cannot guarantee bitwise
+reproducibility when the upstream CLI exposes no seed.
 
-DATA FLOW
+Performance
+-----------
+The upstream simulator is CPU-oriented. Runtime grows roughly with pixel count,
+so independent clips should be processed in parallel rather than changing the
+published model.
+
+Data flow
 ---------
-  linear luminance TIFFs (16-bit, 1280x720, 119.88fps)
-      │
-      ├─[lib]─ N1 FRAMES → N2 LOAD f32(0..255) → N3 IMPORT SIM → N4 LOOP ─┐
-      │                                                                    │
-      └─[cli]─ C1 PNG8 + info.txt → C2 main.py subprocess → C3 gom .txt ──┤
-                                                                           ▼
-                                          N5 NORMALIZE (tự suy cột t,x,y,p)
-                                                                           ▼
-                                          N6 events.h5 (x,y,t[µs],p{0,1})
+Linear luminance TIFF -> float 0..255 -> simulator -> inferred t/x/y/p columns
+-> unified events.h5 plus params.json and simulator git provenance.
 
-TỐC ĐỘ (đọc trước khi than máy chậm):
-  Repo gốc chạy CPU. Paper đo ~15.5 ms/cặp frame ở 346×260 → ở 1280×720
-  (~10.2× pixel) ≈ 160 ms/cặp → clip 60s @119.88fps (7192 cặp) ≈ 19 PHÚT.
-  Cách chữa KHÔNG cần sửa source: chạy nhiều clip song song (mỗi clip 1
-  process), vì các clip độc lập hoàn toàn.
-
-Usage (chạy TRONG env dvsvolt):
-  conda run -n dvsvolt python run_dvsvolt.py --input data/processed/site01 --output data/events_dvsvolt/site01
-  conda run -n dvsvolt python run_dvsvolt.py ... --limit 120    # smoke test
-  conda run -n dvsvolt python run_dvsvolt.py ... --mode cli     # fallback
+Usage:
+  conda run -n dvsvolt python run_dvsvolt.py --input processed --output events
+  conda run -n dvsvolt python run_dvsvolt.py --input processed --output events --limit 120
+  conda run -n dvsvolt python run_dvsvolt.py --input processed --output events --mode cli
 """
 from __future__ import annotations
-# ^ BẮT BUỘC cho env dvsvolt (Python 3.9, cố tình giữ cũ để tương thích
-#   OpenCV 4.5.1). list_frames() dùng "int | None" (PEP 604 union), chỉ
-#   chạy native được từ Python 3.10+. Dòng import này khiến type hint được
-#   coi là STRING (không đánh giá lúc chạy) — tương thích ngược tới 3.7.
+# Required by the Python 3.9 DVS-Voltmeter environment: postponed annotation
+# evaluation keeps PEP 604 hints compatible with the older runtime.
 
 import sys
 import json
@@ -72,7 +58,7 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  NODE 0 · CONFIG  (+ helpers dùng chung — copy có chủ đích từ run_v2e.py)
+#  NODE 0 · CONFIG and intentionally duplicated standalone helpers
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_config(path="config.yaml"):
@@ -91,14 +77,14 @@ def git_hash(repo: Path) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 #  NODE 1 · FRAME LIST + TIMESTAMPS (µs)
 # ══════════════════════════════════════════════════════════════════════════
-#  DVS-Voltmeter nói chuyện bằng MICRO-GIÂY (info.txt của nó là µs) →
-#  t_us[i] = round(i · 1e6 / 119.88). fps_original, không phải fps_export.
+#  DVS-Voltmeter uses microseconds. Derive timestamps from fps_original,
+#  never from the export timeline.
 # ══════════════════════════════════════════════════════════════════════════
 
 def list_frames(input_dir: Path, fps: float, limit: int | None):
     paths = sorted(set(list(input_dir.glob("*.tif")) + list(input_dir.glob("*.tiff"))))
     if not paths:
-        raise FileNotFoundError(f"Không thấy .tif/.tiff trong {input_dir}")
+        raise FileNotFoundError(f"No .tif/.tiff frames found in {input_dir}")
     if limit:
         paths = paths[:limit]
     t_us = np.array([round(i * 1e6 / fps) for i in range(len(paths))], dtype=np.int64)
@@ -108,31 +94,25 @@ def list_frames(input_dir: Path, fps: float, limit: int | None):
 # ══════════════════════════════════════════════════════════════════════════
 #  NODE 2 · LOAD 16-bit → float32 (0..255)
 # ══════════════════════════════════════════════════════════════════════════
-#  ⚠ ĐƠN VỊ QUAN TRỌNG: k1..k6 được calibrate trên ảnh 8-bit (DN 0..255).
-#  Trong model, L xuất hiện ở μ = k1/(L+k2)·k_dL + k4 + k5·L và
-#  σ = k3/(L+k2)·√L + k6 — tức là GIÁ TRỊ TUYỆT ĐỐI của L có nghĩa.
-#  Nếu đút thẳng 0..65535 vào, toàn bộ k sai thang → physics sai.
-#  Chia 257.0 giữ nguyên precision 16-bit (float lẻ) nhưng đúng thang DN
-#  mà bộ k DVS346/DVS240 được sinh ra cho.
+#  Unit contract: k1..k6 were calibrated on 0..255 DN. Absolute L appears in
+#  both drift and noise equations, so passing 0..65535 would invalidate the
+#  model scale. Division by 257 preserves fractional uint16 information.
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_frame_f32(path) -> np.ndarray:
     img = tifffile.imread(str(path))
     if img.ndim != 2:
-        raise ValueError(f"{Path(path).name}: cần grayscale HxW (output preprocess.py), "
+        raise ValueError(f"{Path(path).name}: expected grayscale HxW output from preprocess.py, "
                          f"gặp shape {img.shape}")
     return img.astype(np.float32) / 257.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  NODE 3 · IMPORT SIMULATOR (lib mode) — dò class trong repo research-code
+#  NODE 3 · IMPORT SIMULATOR and discover the research-code API
 # ══════════════════════════════════════════════════════════════════════════
-#  what : import src.simulator (VERIFY-2), tìm class (ưu tiên tên EventSim),
-#         construct với EasyDict cfg giống config.py của nó (SENSOR.K,
-#         SENSOR.CAMERA_TYPE) — thử vài chữ ký constructor phổ biến.
-#  why  : repo nghiên cứu không có API ổn định; dò + fail-loud tốt hơn là
-#         hardcode đại rồi chết khó hiểu.
-#  VERIFY-2: nếu lỗi ở đây → gửi t output của:
+#  Import src.simulator, prefer EventSim, construct its EasyDict-compatible
+#  config, and try known constructor signatures. Discovery plus fail-loud
+#  diagnostics is safer than silently assuming one unstable API.
 #    conda run -n dvsvolt python - <<'PY'
 #    import sys; sys.path.insert(0, "<repo>")
 #    import src.simulator as s, inspect
@@ -151,8 +131,8 @@ def import_sim_class(repo: Path):
         except ImportError:
             continue
     if mod is None:
-        raise RuntimeError(f"Không import được simulator từ {repo} — repo đã clone chưa? "
-                           "(./setup_sim.sh)  Nếu rồi: gửi t output `ls " + str(repo) + "/src`")
+        raise RuntimeError(f"Could not import the simulator from {repo}. "
+                           "(./setup_sim.sh). If it is installed, inspect `ls " + str(repo) + "/src`")
     for cn in ("EventSim", "Simulator", "EventSimulator", "DVSVoltmeter"):
         if hasattr(mod, cn):
             return mod, getattr(mod, cn)
@@ -160,8 +140,8 @@ def import_sim_class(repo: Path):
            if inspect.isclass(o) and o.__module__ == mod.__name__]
     if len(own) == 1:
         return mod, own[0]
-    raise RuntimeError(f"Nhiều class trong {mod.__name__}: {[c.__name__ for c in own]} "
-                       "— xem VERIFY-2 trong file này")
+    raise RuntimeError(f"Multiple candidate classes in {mod.__name__}: {[c.__name__ for c in own]} "
+                       "— review VERIFY-2 in this file")
 
 
 def _describe_signature(cls):
@@ -224,31 +204,28 @@ def construct_sim(cls, K, camera_type, width, height):
         # shape (a different fork/version). Report it with the real signature
         # rather than silently trying something else and corrupting the run.
         raise RuntimeError(
-            f"{cls.__name__} không nhận (cfg, output_folder=, video_name=): {e}\n"
-            f"  Chữ ký thật: {_describe_signature(cls)}\n"
-            f"  Xem API đầy đủ:  python run_dvsvolt.py --print-sim-api --config <cfg>")
+            f"{cls.__name__} rejected (cfg, output_folder=, video_name=): {e}\n"
+            f"  Actual signature: {_describe_signature(cls)}\n"
+            "  Inspect with: python run_dvsvolt.py --print-sim-api --config <cfg>")
     except AttributeError as e:
         # cfg is missing a key this fork reads. Name it — this is the error that
         # used to arrive disguised as a constructor-signature problem.
         raise RuntimeError(
-            f"{cls.__name__} đọc một key mà cfg dựng ở đây không có: {e}\n"
-            f"  cfg hiện có: SENSOR.K, SENSOR.CAMERA_TYPE, DIR.IN_PATH, DIR.OUT_PATH, "
+            f"{cls.__name__} requested a config key not provided here: {e}\n"
+            f"  Available: SENSOR.K, SENSOR.CAMERA_TYPE, DIR.IN_PATH, DIR.OUT_PATH, "
             f"Width, Height\n"
-            f"  Thêm key còn thiếu vào construct_sim() trong file này.")
+            "  Add the documented missing key to construct_sim().")
 
     print(f"  [lib] {cls.__name__}(cfg)  [scratch: {scratch_dir}]")
     return sim
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  NODE 4 · SIMULATION LOOP (lib mode) — dò chữ ký method 1 lần, rồi stream
+#  NODE 4 · Discover one simulation method signature, then stream
 # ══════════════════════════════════════════════════════════════════════════
-#  what : model của nó tích phân GIỮA 2 frame → chữ ký tự nhiên là
-#         (f_prev, f_cur, t_prev, t_cur). Một số bản viết kiểu stream
-#         (f, t) có state bên trong. Dò cả hai ở cặp đầu (VERIFY-3),
-#         khóa lại, rồi stream từ đĩa (không preload — 26GB RAM đó m).
-#  seed : np.random.seed + torch.manual_seed TRƯỚC khi sim — cái mà main.py
-#         gốc không làm được (điểm cộng reproducibility của lib mode).
+#  The model naturally integrates between frame pairs, but some versions expose
+#  a stateful (frame, time) method. Probe both on the first pair, lock the
+#  compatible method, and stream. Seed NumPy/Torch before construction.
 # ══════════════════════════════════════════════════════════════════════════
 
 def _resolve_caller(sim, f0, f1, t0, t1):
@@ -286,24 +263,24 @@ def _resolve_caller(sim, f0, f1, t0, t1):
             return ("pair", fn, ev)
 
         if binds(f0, int(t0)):
-            fn(f0, int(t0))                      # nạp baseline
+            fn(f0, int(t0))                      # Load the baseline frame.
             ev = fn(f1, int(t1))
             print(f"  [lib] method: .{m}(frame, t)  [stream/stateful]")
             return ("stream", fn, ev)
 
-        failures.append(f"    - .{m}{_describe_method_sig(fn)}: không khớp cả 2 kiểu gọi")
+        failures.append(f"    - .{m}{_describe_method_sig(fn)}: matched neither call form")
 
-    detail = "\n".join(failures) if failures else "    (không tìm thấy method ứng viên nào)"
+    detail = "\n".join(failures) if failures else "    (no candidate method found)"
     raise RuntimeError(
-        "Không khớp được method sinh event nào. Đã thử:\n" + detail +
-        "\n  Xem API thật:  python run_dvsvolt.py --print-sim-api --config <cfg>")
+        "No event-generation method matched. Tried:\n" + detail +
+        "\n  Inspect the actual API: python run_dvsvolt.py --print-sim-api --config <cfg>")
 
 
 def _describe_method_sig(fn):
     try:
         return str(inspect.signature(fn))
     except (ValueError, TypeError):
-        return "(<không introspect được>)"
+        return "(<not introspectable>)"
 
 
 def run_lib(repo: Path, paths, t_us, K, camera_type, width, height, seed: int):
@@ -334,24 +311,22 @@ def run_lib(repo: Path, paths, t_us, K, camera_type, width, height, seed: int):
         if i % 200 == 0 or i == len(paths) - 1:
             r = i / (time.time() - t0w)
             eta = (len(paths) - 1 - i) / r if r > 0 else 0
-            print(f"  [lib] {i:>6}/{len(paths)-1} cặp  {r:.1f} cặp/s  ETA {eta/60:.1f} phút  "
+            print(f"  [lib] {i:>6}/{len(paths)-1} pairs  {r:.1f} pairs/s  ETA {eta/60:.1f} min  "
                   f"events: {sum(len(c) for c in chunks):,}")
     if not chunks:
-        raise RuntimeError("DVS-Voltmeter không sinh event nào — kiểm tra input/k params")
+        raise RuntimeError("DVS-Voltmeter produced no events; check input and k parameters.")
     return np.concatenate(chunks, axis=0)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  C1–C3 · CLI FALLBACK — chạy main.py GỐC, không đụng 1 dòng
+#  C1–C3 · CLI FALLBACK through the unmodified upstream main.py
 # ══════════════════════════════════════════════════════════════════════════
-#  C1: xuất PNG 8-bit + info.txt ("<abs_path> <t_us>") theo layout
-#      input_dir/<session>/  mà main.py gốc duyệt (VERIFY-4: nếu output
-#      rỗng → thử --input_dir trỏ THẲNG vào folder session, driver tự in
-#      gợi ý).
-#  C2: subprocess main.py với các flag ĐÃ XÁC NHẬN từ source:
+#  C1: export 8-bit PNG plus info.txt ("<abs_path> <t_us>") in the repository layout
+#      input_dir/<session>/ expected by main.py.
+#  C2: invoke main.py with source-verified flags:
 #      --input_dir --output_dir --camera_type --model_para k1..k6
-#  C3: gom mọi *.txt nó xuất (np.savetxt fmt='%1.0f') → concat → N5.
-#  ⚠ main gốc KHÔNG có seed → cli mode không reproducible bит-perfect.
+#  C3: concatenate all emitted text events. The upstream CLI exposes no seed,
+#      so CLI mode cannot promise bitwise reproducibility.
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_cli(repo: Path, paths, t_us, K, camera_type, workdir: Path, env_name: str):
@@ -383,9 +358,9 @@ def run_cli(repo: Path, paths, t_us, K, camera_type, workdir: Path, env_name: st
 
     txts = sorted(out_dir.rglob("*.txt"))
     if not txts:
-        raise RuntimeError("main.py không xuất .txt nào. VERIFY-4: thử sửa --input_dir "
-                           f"trỏ thẳng {workdir/'in'/session} rồi chạy lại; hoặc gửi t "
-                           "output `ls -R` của workdir để t khớp layout.")
+        raise RuntimeError(
+            "main.py emitted no text files. Inspect its expected input layout; "
+            f"the session directory is {workdir/'in'/session}.")
     arrs = [np.loadtxt(str(t)) for t in txts]
     arrs = [a.reshape(-1, 4) for a in arrs if a.size]
     print(f"  [cli] C3: gom {len(txts)} file .txt → {sum(len(a) for a in arrs):,} events")
@@ -393,19 +368,19 @@ def run_cli(repo: Path, paths, t_us, K, camera_type, workdir: Path, env_name: st
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  NODE 5 · NORMALIZE — (bản sao có chủ đích từ run_v2e.py, xem note bên đó)
+#  NODE 5 · NORMALIZE — intentionally duplicated from the standalone v2e runner
 # ══════════════════════════════════════════════════════════════════════════
 
 def normalize_events(arr, width: int, height: int, dur_us_hint: float):
     a = np.asarray(arr, dtype=np.float64)
     if a.ndim != 2 or a.shape[1] != 4:
-        raise ValueError(f"Cần Nx4, gặp {a.shape}")
+        raise ValueError(f"Expected an Nx4 array, got {a.shape}")
     cols = set(range(4))
 
     p_col = next((c for c in cols
                   if set(np.unique(a[:, c]).astype(np.int64).tolist()) <= {-1, 0, 1}), None)
     if p_col is None:
-        raise ValueError("Không tìm được cột polarity (giá trị ngoài {-1,0,1})")
+        raise ValueError("Could not identify a {-1,0,1} polarity column")
     cols.discard(p_col)
 
     t_col, best = None, -1.0
@@ -436,7 +411,7 @@ def normalize_events(arr, width: int, height: int, dur_us_hint: float):
     p = np.where(a[:, p_col] > 0, 1, 0).astype(np.uint8)
     order = np.argsort(t, kind="stable")
 
-    print(f"  [norm] suy cột: t=c{t_col}({unit})  x=c{x_col}  y=c{y_col}  p=c{p_col}"
+    print(f"  [norm] inferred columns: t=c{t_col}({unit})  x=c{x_col}  y=c{y_col}  p=c{p_col}"
           f"   |  {len(t):,} events, {(t.max()-t.min())/1e6:.2f}s")
     x = np.clip(np.rint(a[order, x_col]), 0, width - 1).astype(np.uint16)
     y = np.clip(np.rint(a[order, y_col]), 0, height - 1).astype(np.uint16)
@@ -452,7 +427,7 @@ def normalize_events(arr, width: int, height: int, dur_us_hint: float):
 
 def write_h5(out_dir: Path, ev: dict, attrs: dict):
     if h5py is None:
-        raise RuntimeError("pip install h5py trong env dvsvolt")
+        raise RuntimeError("Install h5py in the dvsvolt environment.")
     out_dir.mkdir(parents=True, exist_ok=True)
     h5path = out_dir / "events.h5"
     with h5py.File(h5path, "w") as f:
@@ -476,34 +451,32 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--mode", choices=["lib", "cli"], default="lib",
-                    help="lib = 16-bit + seed (default) | cli = main.py gốc, 8-bit, no seed")
-    ap.add_argument("--limit", type=int, default=None, help="chỉ N frame đầu (smoke test)")
+                    help="lib = 16-bit + seed (default) | cli = original main.py, 8-bit, no seed")
+    ap.add_argument("--limit", type=int, default=None, help="Use only the first N frames")
     ap.add_argument("--print-sim-api", action="store_true",
-                    help="In class + chữ ký constructor + các method sinh event của repo "
-                         "DVS-Voltmeter rồi thoát. Thay cho đoạn heredoc VERIFY-2 phải "
-                         "gõ tay. Không cần --input/--output.")
+                    help="Print discovered simulator classes/signatures and exit")
     args = ap.parse_args()
 
     if args.print_sim_api:
-        # Chạy trước --input/--output vì đây là bước chẩn đoán, không cần data.
+        # Diagnostics do not require input/output data.
         cfg0 = load_config(args.config)
         repo0 = Path(cfg0["paths"].get("dvsvolt_repo",
                                        "~/caroect_sim/DVS-Voltmeter")).expanduser()
         if not repo0.exists():
-            raise FileNotFoundError(f"DVS-Voltmeter repo chưa có ở {repo0}")
+            raise FileNotFoundError(f"DVS-Voltmeter repository not found at {repo0}")
         mod, cls = import_sim_class(repo0)
         print(f"module      : {mod.__name__}  ({getattr(mod, '__file__', '?')})")
         print(f"class       : {cls.__name__}")
         print(f"__init__    : {_describe_signature(cls)}")
-        print("methods sinh event ứng viên:")
+        print("candidate event-generation methods:")
         for m in ("generate_events", "simulate", "__call__", "run"):
             fn = getattr(cls, m, None)
             if callable(fn):
                 try:
                     print(f"  .{m}{inspect.signature(fn)}")
                 except (ValueError, TypeError):
-                    print(f"  .{m}(<không introspect được>)")
-        print("\ncác class khác trong module:")
+                    print(f"  .{m}(<not introspectable>)")
+        print("\nother classes in the module:")
         print("  " + ", ".join(n for n, o in vars(mod).items()
                                if inspect.isclass(o) and o.__module__ == mod.__name__))
         return
@@ -516,10 +489,11 @@ def main():
     K = dv["k"]
     camera_type = dv.get("camera_type", "DVS346")
     if len(K) != 6:
-        raise ValueError(f"dvs_voltmeter.k phải đúng 6 số (k1..k6), đang có {len(K)}")
+        raise ValueError(f"dvs_voltmeter.k requires six values; got {len(K)}")
     repo = Path(cfg["paths"].get("dvsvolt_repo", "~/caroect_sim/DVS-Voltmeter")).expanduser()
     if not repo.exists():
-        raise FileNotFoundError(f"DVS-Voltmeter repo chưa có ở {repo} — chạy ./setup_sim.sh trước")
+        raise FileNotFoundError(
+            f"DVS-Voltmeter repository not found at {repo}; run setup_sim.sh")
 
     in_dir, out_dir = Path(args.input), Path(args.output)
     paths, t_us = list_frames(in_dir, fps, args.limit)
@@ -537,11 +511,11 @@ def main():
 
     ev = normalize_events(raw, W, H, dur_us)
     attrs = dict(simulator="dvs_voltmeter", mode=args.mode, git_commit=git_hash(repo),
-                 seed=(seed if args.mode == "lib" else "N/A (cli mode không seed được)"),
+                 seed=(seed if args.mode == "lib" else "N/A (upstream CLI has no seed)"),
                  fps=fps, width=W, height=H, camera_type=camera_type,
                  source=str(in_dir), params=dict(k=list(map(float, K))))
     write_h5(out_dir, ev, attrs)
-    print(f"\n✓ Xong. Chạy nhiều clip song song để bù tốc độ CPU (xem header file).\n")
+    print("\nDone. Process independent clips in parallel to offset CPU runtime.\n")
 
 
 if __name__ == "__main__":

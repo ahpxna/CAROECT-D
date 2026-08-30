@@ -1,152 +1,106 @@
-# ─────────────────────────────────────────────────────
-# CAROECT-D Pipeline Configuration
-# (OpenCV preprocess — no Studio  |  simulators as libraries — no forks)
-# ─────────────────────────────────────────────────────
-# AI LÀM GÌ (pipeline v2 — dual branch, hình học share by construction)
-#   DaVinci FREE   : decode .NEV -> Rec.2020/LINEAR, (stabilize nếu cần,
-#                    1 EXPORT DUY NHẤT), 16-bit TIFF
-#   preprocess.py  : N1 load -> N1.5 decode(srgb? -> linear, TRƯỚC corrections)
-#                    -> N2 dark -> N3 flat -> N4 WB -> N4.5 exposure
-#                    -> N5 undistort -> N6 resize -> N6.5 stabilize(opt)
-#                    -> TÁCH NHÁNH (hình học đóng băng từ đây):
-#                       N7a sRGB 8-bit PNG  -> SAM3+DINO (label)
-#                       N7b RGB->Y 16-bit TIFF -> simulator (event)
-#   run_v2e.py     : gọi v2e EventEmulator như library (16-bit path)
-#   run_dvsvolt.py : gọi DVS-Voltmeter simulator như library (16-bit path)
-#   -> cả hai xuất CÙNG schema events.h5 (x, y, t[µs], p{0,1}) như read_evt3.py
-# NGUYÊN TẮC: tone 2 nhánh ĐƯỢC PHÉP khác (sRGB vs linear — monotonic,
-# không di chuyển pixel); hình học 2 nhánh TUYỆT ĐỐI giống (cùng 1 mảng
-# RGB qua undistort/resize/stabilize đúng 1 lần -> label copy 1:1).
-# ─────────────────────────────────────────────────────
+# CAROECT-D paper-aligned pipeline configuration.
+# The frame and event branches share one geometric transform. Photometric
+# operations may differ after that shared grid is frozen.
 
 paths:
   calibration_dir: "calibration"
-  sim_root:        "~/caroect_sim"                 # setup_sim.sh trồng repo ở đây
-  v2e_repo:        "~/caroect_sim/v2e"
-  dvsvolt_repo:    "~/caroect_sim/DVS-Voltmeter"
+  sim_root: "~/caroect_sim"
+  v2e_repo: "~/caroect_sim/v2e"
+  dvsvolt_repo: "~/caroect_sim/DVS-Voltmeter"
 
 camera:
-  # ── FRAME RATE (bẫy chết người — đọc kỹ) ────────────────────────
-  #   Free DaVinci cap timeline ở fps_export -> để KHÔNG mất/nội suy frame,
-  #   RELABEL (không retime!) clip gốc qua Clip Attributes > Frame Rate:
-  #   đổi số ghi trong metadata từ fps_original xuống fps_export. Đây chỉ là
-  #   gắn nhãn lại — Resolve hiểu "clip này VỐN LÀ fps_export" nên giữ
-  #   NGUYÊN mọi frame gốc, chỉ là clip giờ chạy chậm lại ~(fps_original/
-  #   fps_export) lần trên timeline. Kéo vào timeline fps_export rồi export
-  #   TIFF bình thường -> ra ĐỦ số frame của clip gốc (không phải 1 frame/
-  #   frame timeline). Đừng dùng Retime/Optical Flow — đó là nội suy/drop
-  #   frame thật, phá đúng thứ mình đang tránh.
-  #   VERIFY sau export: #TIFF ≈ clip_seconds × fps_original (giây tính theo
-  #   ĐỒNG HỒ THẬT của cảnh quay, không phải theo timeline đã bị kéo dài).
-  #   Nếu ra ~1/N -> DaVinci đã DROP/nội suy frame thật -> làm lại.
-  #   ⚠ fps_original PHẢI là tốc độ CAMERA THẬT quay, không phải con số dùng
-  #   để relabel. Kiểm tra kỹ trong menu camera: một số máy phân biệt "120p"
-  #   (đúng 120.000) và "119.88p" (chuẩn NTSC-pulldown) — hai giá trị LỆCH
-  #   ~0.1%, đủ để timestamp trôi dần trên clip dài nếu ghi nhầm số. Xem
-  #   đúng số trong file thông tin clip gốc (MediaInfo/Clip Attributes),
-  #   đừng suy đoán từ tên preset.
-  #   Mọi simulator nhận fps_original; KHÔNG BAO GIỜ đưa fps_export.
-  fps_original:   119.88   # ⚠ XÁC NHẬN LẠI đúng số camera thật dùng — có thể là 120.0 chính xác
-  fps_export:     29.97    # fps timeline DaVinci Free — chỉ dùng để relabel/export, KHÔNG dùng cho timestamp
-  width:          1280      # IMX636 native (Triton2 EVS)
-  height:         720
+  # Capture timestamps use fps_original. fps_export describes only the
+  # DaVinci relabel/export timeline and must never drive event timestamps or
+  # detector window duration.
+  fps_original: 119.88
+  fps_export: 29.97
+  width: 1280
+  height: 720
 
-  # ── COLOR / LINEARITY ───────────────────────────────────────────
-  input_transfer: linear    # linear (khuyên dùng) | srgb — xem preprocess.py
-  # CHỐT: Project Settings > Color Management xác nhận Input=Output=
-  # Rec.2020/Linear (identity transform, không cross-gamut mapping —
-  # né hoàn toàn vùng tranh cãi DaVinci Wide Gamut whitepaper-vs-thực-tế,
-  # xem colour-science GitHub issue #658). File TIFF xuất ra ở Rec.2020
-  # primaries thật, nên trọng số Rec.2020 là đúng, không phải đoán:
-  #   Y = 0.2627 R + 0.6780 G + 0.0593 B
-  luma_coeffs:    [0.2627, 0.6780, 0.0593]
+  # Acquisition uses the camera's SDR N-RAW mode, not N-Log. DaVinci performs
+  # the SDR decode and exports a linear Rec.709 16-bit TIFF working signal.
+  # Python receives data that is already linear and must not apply a second
+  # EOTF/inverse-gamma operation.
+  input_transfer: linear
+  # Linear Rec.709 uses the same D65 primaries as sRGB; only the transfer
+  # function differs. The working signal here is linear, not sRGB-encoded.
+  working_primaries: srgb
+  luma_coeffs: [0.2126, 0.7152, 0.0722]
 
 preprocessing:
-  dark_correction: true
-  flat_field:      true
-  white_balance:   true
-  # Exposure normalization: needs a gray_card.tiff shot EVERY session (same
-  # patch calibrate.py already uses for white_balance) — corrects for the
-  # camera's own exposure (ISO/aperture/shutter) differing between sessions,
-  # so brightness differences reflect the SCENE, not that day's exposure
-  # settings. First-ever calibrate.py run bootstraps the canonical target;
-  # every later session's own reading is scaled to match it.
+  # Optional radiometric corrections are off until a validated
+  # calibration/calibration_manifest.json explicitly supports them.
+  dark_correction: false
+  flat_field: false
+  white_balance: false
   exposure_normalize: false
-  undistort:       true
+  undistort: true
   undistort_alpha: 0.0
-  # CHÍNH SÁCH STABILIZE (đã chốt — đọc kỹ trước khi bật):
-  #  * Ưu tiên stabilizer của DaVinci (Mode=Translation) TRƯỚC export —
-  #    1 export duy nhất nuôi cả 2 nhánh, hình học tự động share.
-  #  * Nếu model sẽ TEST trên event camera THẬT (Triton2): KHÔNG stabilize
-  #    ở bất kỳ đâu — event cam thật không stabilize được, giữ cùng
-  #    thống kê rung cho train và test (xem thảo luận stabilize->mAP).
-  #  * Cờ dưới đây là fallback OpenCV (two-pass) khi không dùng DaVinci.
-  stabilize:       false
-  # denoise: CHỈ áp lên nhánh Y (event) — photometric-only, không di chuyển
-  # pixel nên label từ nhánh sRGB vẫn khớp. Nhánh SAM3 không cần denoise.
-  denoise:                  none    # none | bilateral (xem note trong preprocess.py)
-  denoise_bilateral_d:      5
-  denoise_bilateral_sigma:  0.02
+  stabilize: false
+  denoise: none
+  denoise_bilateral_d: 5
+  denoise_bilateral_sigma: 0.02
 
 calibration:
-  gray_card_roi:  null
-  board_cols:     9
-  board_rows:     6
-  square_size_m:  0.025
+  gray_card_roi: null
+  board_cols: 9
+  board_rows: 6
+  square_size_m: 0.025
+  # Capture/decode details are copied into calibration_manifest.json.
+  acquisition:
+    raw_mode: "SDR N-RAW 12-bit (not N-Log)"
+    linearization_owner: "DaVinci Resolve"
+    working_output: "linear Rec.709 RGB TIFF uint16"
+    settings_id: null
+  linearity_levels_dir: "linearity"
+  exposure_reference_level: null
 
-# ═════════════════════════════════════════════════════
-#  GHI EVENT THẬT (evs_recorder.cpp -> xypt_to_h5.py)
-# ═════════════════════════════════════════════════════
 recording:
-  # Dùng cho: (1) calibrate_simulator.py — fit θ simulator khớp vật lý thật,
-  #           (2) eval_event_yolo.py --data <real_test> — domain-transfer test.
-  strict_xypt:   true
-  flat_xypt:     true
+  strict_xypt: true
+  flat_xypt: true
   t_unit: "us"
 
-# ═════════════════════════════════════════════════════
-#  SIMULATORS
-# ═════════════════════════════════════════════════════
 simulator:
-  seed: 42                  # np.random + torch.manual_seed + v2e emulator seed
-  envs:                     # tên conda env (setup_sim.sh tạo)
-    v2e:     v2e
+  seed: 42
+  envs:
+    v2e: v2e
     dvsvolt: dvsvolt
+  calibration_metrics:
+    fields: [rate_total, on_fraction]
+    weights:
+      rate_total: 1.0
+      on_fraction: 0.5
 
 v2e:
-  # Điểm khởi đầu cho IMX636 (Triton2 EVS) — SẼ calibrate lại bằng recording thật.
-  # pos/neg = 0.25 theo "Nominal contrast threshold 25%(ln)" của IMX636 (EVK4 manual).
-  pos_thres:            0.25    # ngưỡng ON, log-contrast   [~0.1–0.5]
-  neg_thres:            0.25    # ngưỡng OFF                 [~0.1–0.5]
-  sigma_thres:          0.03    # mismatch pixel-pixel       [0.03–0.05]
-  cutoff_hz:            200     # bandwidth photoreceptor    [sáng tốt 200–300, thiếu sáng 30–100]
-  leak_rate_hz:         0.1     # leak/background events     [0 = tắt; tăng khi tối]
-  shot_noise_rate_hz:   0.001   # shot noise                 [tăng 0.1–5 khi tối]
-  refractory_period:    0.001   # thời gian chết sau event (s)
-  disable_slomo:        true    # input 119.88fps ~8.3ms/frame — KHÔNG cần SuperSloMo
-  slomo_model:          null
+  pos_thres: 0.25
+  neg_thres: 0.25
+  sigma_thres: 0.03
+  cutoff_hz: 200
+  leak_rate_hz: 0.1
+  shot_noise_rate_hz: 0.001
+  refractory_period: 0.001
+  disable_slomo: true
+  slomo_model: null
 
 dvs_voltmeter:
-  # Model: Brownian motion with drift trên điện áp pixel.
-  #   μ = k1/(L+k2)·k_dL + k4 + k5·L        (drift — tín hiệu + leak)
-  #   σ = k3/(L+k2)·√L + k6                  (noise — shot + thermal)
-  # Ý nghĩa: k1 gain tín hiệu | k2 dark current | k3 photon shot noise
-  #          k4 leak nhiệt (hằng) | k5 leak parasitic (~L) | k6 noise điện tử
-  # ⚠ k calibrated trên thang DN 0..255 — driver tự đổi 16-bit về thang này.
-  # ⚠ CHƯA có bộ k công bố cho IMX636 -> khởi đầu DVS346, calibrate k1,k2 trước.
   camera_type: DVS346
-  k: [5.3, 20, 0.0001, 1.0e-7, 5.0e-9, 1.0e-5]     # preset DVS346 (paper ECCV2022)
-  # k: [4.4, 23, 0.0002, 1.0e-7, 5.0e-8, 1.0e-5]   # preset DVS240 (để so sánh)
+  k: [5.3, 20, 0.0001, 1.0e-7, 5.0e-9, 1.0e-5]
 
-# ═════════════════════════════════════════════════════
-#  LABEL TRANSFER  (sam3_export_tracks.py -> label_transfer.py)
-# ═════════════════════════════════════════════════════
 label_transfer:
-  score_threshold:   0.3
-  cross_class_iou:   0.85
-  max_gap_frames:    5
-  window_us:         null
-  dense_event_labels: true
+  score_threshold: 0.3
+  cross_class_iou: 0.85
+  max_gap_frames: 5
+  window_us: 8340
+  window_ablation_us: [8340, 16700, 33300, 50000]
+  dense_event_labels: false
+  sync:
+    allow_unsynced_real: false
+  sam_merge:
+    continuity_iou_tolerance: 0.02
+    score_tolerance: 0.02
+    horizon_y: 0.45
+    horizon_weight: 0.35
+    area_trend_weight: 0.65
   class_names:
     - car
     - truck
@@ -157,24 +111,17 @@ label_transfer:
     - micromobility
     - other
 
-# ═════════════════════════════════════════════════════
-#  DATASET  (build_event_dataset.py)
-# ═════════════════════════════════════════════════════
 dataset:
-  img_size: [640, 640]
+  # null means the native/common 1280x720 grid. Alternate sizes are
+  # aspect-preserving letterbox outputs, never anisotropic scale-fill.
+  img_size: null
   export_coco: true
-  # 3 split policy CAROECT-D — điền sau khi có danh sách site thật:
-  # splits:
-  #   by_scene:    {train: [site01..site15], test: [site16..site20]}
-  #   by_view:     {train: [site01_view1..4], test: [site01_view5]}
-  #   by_lighting: {train: [site01_day, site01_dusk], test: [site01_night]}
+  representation_version: "caroectd-count-time-v2"
+  count_clip_percentile: 99.5
 
-# ═════════════════════════════════════════════════════
-#  TRAIN / EVAL  (train_event_yolo.py / eval_event_yolo.py)
-# ═════════════════════════════════════════════════════
 train:
-  model:      yolov8n.pt
-  epochs:     100
-  imgsz:      640
-  batch:      16
-  patience:   30
+  model: yolov8n.pt
+  epochs: 100
+  imgsz: 640
+  batch: 16
+  patience: 30

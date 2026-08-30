@@ -24,7 +24,7 @@ Email: withheld@withheld.edu}
 \maketitle
 
 \begin{abstract}
-Event cameras are attractive for intelligent transportation systems (ITS) because of their microsecond temporal resolution, wide dynamic range, and sparse, motion-triggered output. Static, roadside deployments of event cameras remain comparatively underexplored relative to ego-motion event datasets, and the two existing roadside efforts occupy opposite ends of a cost-fidelity trade-off: eTraM \cite{verma2024etram} preserves sensor fidelity but depends on two million manually drawn bounding boxes, while TUMTraf Event \cite{cress2024tumtraf} automates annotation by projecting RGB detections onto a physically separate event camera, at the cost of a several-pixel targetless-calibration error and day-only pseudo-label supervision. This paper presents the methodology of CAROECT-D, a pipeline that synthesizes event streams directly from RGB video rather than acquiring them from a second, physically offset sensor, so that annotation and events originate from an identical pixel grid by construction. The pipeline converts N-RAW video into 16-bit scene-linear radiance, applies a single frozen geometric undistortion before the data forks into an sRGB annotation branch and a linear event-generation branch, and generates events with two complementary models: a deterministic lowpass-and-threshold model (v2e \cite{hu2021v2e}) and a stochastic drift-diffusion model (Raw2Event/DVS-Voltmeter \cite{ning2025raw2event,lin2022dvsvoltmeter}), the latter avoiding the temporal-layering artifact induced by frame-locked linear interpolation. Dense, multi-class annotations are produced automatically on the RGB branch with the Segment Anything Model 3 (SAM 3) promptable concept segmentation task \cite{carion2025sam3} and transferred to the synthetic event stream through the shared geometry and a shared frame clock. We detail the mathematical formulation of every stage; quantitative experimental validation is left to a subsequent report, as data collection has not yet been completed.
+Event cameras are attractive for intelligent transportation systems (ITS) because of their microsecond temporal resolution, wide dynamic range, and sparse, motion-triggered output. Static, roadside deployments of event cameras remain comparatively underexplored relative to ego-motion event datasets, and the two existing roadside efforts occupy opposite ends of a cost-fidelity trade-off: eTraM \cite{verma2024etram} preserves sensor fidelity but depends on two million manually drawn bounding boxes, while TUMTraf Event \cite{cress2024tumtraf} automates annotation by projecting RGB detections onto a physically separate event camera, at the cost of a several-pixel targetless-calibration error and day-only pseudo-label supervision. This paper presents the methodology of CAROECT-D, a pipeline that synthesizes event streams directly from RGB video rather than acquiring them from a second, physically offset sensor, so that annotation and events originate from an identical pixel grid by construction. The acquisition uses SDR N-RAW rather than N-Log; DaVinci Resolve decodes the SDR source and exports 16-bit linear Rec.709 RGB before the Python pipeline begins. A single frozen geometric undistortion is then applied before the data forks into an sRGB annotation branch and a linear event-generation branch. The latter generates events with two complementary models: a deterministic lowpass-and-threshold model (v2e \cite{hu2021v2e}) and a stochastic drift-diffusion model (Raw2Event/DVS-Voltmeter \cite{ning2025raw2event,lin2022dvsvoltmeter}), the latter avoiding the temporal-layering artifact induced by frame-locked linear interpolation. Frame-observation, multi-class annotations are produced automatically on the RGB branch with the Segment Anything Model 3 (SAM 3) promptable concept segmentation task \cite{carion2025sam3} and transferred to the synthetic event stream through the shared geometry and a shared frame clock. We detail the mathematical formulation of every stage; quantitative experimental validation is left to a subsequent report, as data collection has not yet been completed.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -105,7 +105,7 @@ The pipeline is organized around one governing constraint: every downstream step
 \begin{figure}[t]
 \centering
 % Placeholder: pipeline block diagram.
-\caption{CAROECT-D pipeline overview. Radiometric linearization and geometric undistortion are applied once to a shared 16-bit linear volume before the pipeline forks into an annotation branch (SAM~3) and an event-generation branch (v2e / DVS-Voltmeter), which are re-joined by the spatiotemporal label-assignment operator of Section~\ref{sec:labeltransfer}.}
+\caption{CAROECT-D pipeline overview. DaVinci Resolve converts SDR N-RAW (not N-Log) to a shared 16-bit linear Rec.709 volume. Python applies geometric undistortion once before the annotation branch (SAM~3) and event-generation branch (v2e / DVS-Voltmeter) fork; causal labels rejoin them at exact frame observation times.}
 \label{fig:pipeline}
 \end{figure}
 
@@ -119,14 +119,14 @@ Traffic scenes are captured with two rigidly co-located, time-synchronized camer
 \end{equation}
 which reproduces the two operating points used throughout this design: $84.0^{\circ}$ for the RGB rig ($w=36$~mm, $f=20$~mm) and $54.8^{\circ}$ for the event rig ($w=6.2208$~mm, $f=6$~mm). Because the event sensor's field of view is a strict subset of the RGB sensor's field of view, spatial alignment (Section~\ref{sec:geometric}) is a cropping and registration problem rather than a stereo-baseline problem.
 
-Raw video is processed at the event camera's native frame rate of 119.88~fps. The pipeline branches into (i) an sRGB annotation branch that is tone-mapped for SAM~3, and (ii) a 16-bit linear event-generation branch. The event branch ultimately yields an asynchronous stream of tuples
+The camera records 12-bit SDR N-RAW, explicitly not N-Log. DaVinci Resolve performs the SDR decode and linearization, exporting 16-bit linear Rec.709 RGB at the native 119.88~fps capture cadence. The Python pipeline treats this export as already linear and does not apply a second inverse transfer function. It branches into (i) an sRGB annotation branch encoded for SAM~3, and (ii) a 16-bit linear event-generation branch. The event branch ultimately yields an asynchronous stream of tuples
 \begin{equation}
 e_k = (x_k, y_k, t_k, p_k), \qquad p_k \in \{0,1\},
 \label{eq:eventtuple}
 \end{equation}
 denoting pixel location, microsecond timestamp, and polarity.
 
-\subsection{Radiometric Preprocessing and Photometric Linearization}
+\subsection{DaVinci SDR-to-Linear Decode and Radiometric Preprocessing}
 \label{sec:radiometric}
 
 \subsubsection{Weber's Law and the Log-Intensity Trigger}
@@ -178,16 +178,16 @@ too small to ever cross $\theta$, so the same 8-bit simulator is effectively bli
 
 \subsubsection{16-bit Linear Radiometry}
 
-CAROECT-D bypasses the camera's Image Signal Processor (ISP) entirely and exports 16-bit linear TIFFs directly from N-RAW, so $I\in\{0,\dots,65535\}$, a 256-fold larger quantization space than 8-bit. Equation~\eqref{eq:quantbound} shows why this matters directly: for the same absolute scene darkness that produced $I=1$ at 8-bit, the equivalent 16-bit code value is on the order of $I\approx256$ (the exact 8-to-16-bit scale factor is $65536/256=256$), giving
+CAROECT-D records 12-bit SDR N-RAW and uses an explicitly configured DaVinci Resolve transform to export 16-bit linear Rec.709 TIFFs. Thus $I\in\{0,\dots,65535\}$ at the pipeline boundary, a 256-fold larger code space than 8-bit. The claim concerns the precision and declared linear transfer of the working export; it does not claim that the codes are untouched raw photosite values or that SDR capture has the full dynamic range of the physical event sensor. Equation~\eqref{eq:quantbound} shows why this matters directly: for the same absolute scene darkness that produced $I=1$ at 8-bit, the equivalent 16-bit code value is on the order of $I\approx256$ (the exact 8-to-16-bit scale factor is $65536/256=256$), giving
 \begin{equation}
 \Delta L_{step}(256) = \ln 257 - \ln 256 \approx 0.0039,
 \label{eq:sixteenbitshadow}
 \end{equation}
-i.e.\ the shadow regime at 16-bit inherits the same fine log-intensity resolution that only the brightest regime enjoyed at 8-bit (compare Eq.~\eqref{eq:brightextreme}). Because the data also bypasses the non-linear gamma curve, pixel values remain proportional to photon count, so Eq.~\eqref{eq:gammascale} reduces to the identity $L_{sRGB}=L$ ($\gamma=1$). Equations~\eqref{eq:quantbound}--\eqref{eq:sixteenbitshadow} together justify targeting the $>120$~dB dynamic range of the physical Sony IMX636 sensor from a 16-bit linear source rather than an 8-bit tone-mapped one, and are consistent with the independent raw-versus-ISP comparison reported for Raw2Event \cite{ning2025raw2event}, obtained on different hardware.
+i.e.\ the rescaled 16-bit working representation offers a substantially finer numerical step than 8-bit (compare Eq.~\eqref{eq:brightextreme}). Because DaVinci has already removed the declared SDR encoding, the Python pipeline receives a linear working signal and Eq.~\eqref{eq:gammascale} is not applied a second time. Equations~\eqref{eq:quantbound}--\eqref{eq:sixteenbitshadow} justify using high-precision linear working data rather than an 8-bit tone-mapped delivery image. Matching the physical IMX636's dynamic range remains an empirical calibration question and is not inferred from TIFF bit depth alone.
 
 \subsubsection{Physical Corrections on Linear Data}
 
-Because the exported data remains scene-linear, standard radiometric calibration is valid prior to any tone mapping:
+Because DaVinci exports a declared linear-light working signal, standard radiometric corrections can be evaluated before the annotation branch applies its sRGB display transfer:
 \begin{equation}
 I_{corr} = (I_{raw} - I_{dark}) \cdot M_{gain} \cdot W_{gain} \cdot S_{exp},
 \label{eq:radcorr}
@@ -261,7 +261,7 @@ whose truncation error is $O(\Delta t_{frame})$. Standard video datasets operate
 Y = c_R R + c_G G + c_B B.
 \label{eq:luma}
 \end{equation}
-The reference v2e implementation \cite{hu2021v2e} defaults to BT.601/BT.709 weights; because this pipeline operates on wide-gamut, 16-bit linear N-RAW data rather than tone-mapped video, it instead adopts ITU-R BT.2020 weights $(c_R,c_G,c_B)=(0.2627, 0.6780, 0.0593)$, which sum to unity and match the sensor's native color primaries more closely. Frame upsampling via the learned interpolation network v2e optionally applies is disabled, since native capture already occurs at 119.88~fps; enabling it would risk hallucinated motion detail between real frames that are already closely spaced.
+The pipeline operates on a 16-bit linear Rec.709 working signal and therefore uses the matching Rec.709 luminance weights $(c_R,c_G,c_B)=(0.2126, 0.7152, 0.0722)$ before event simulation. Frame upsampling via the learned interpolation network v2e optionally applies is disabled, since native capture already occurs at 119.88~fps; enabling it would risk hallucinated motion detail between real frames that are already closely spaced.
 
 \textbf{Hybrid lin-log mapping.} A pure logarithm diverges as $Y\to0$, so v2e uses a piecewise mapping with transition point $I_{lin}$ (typically 20~DN):
 \begin{equation}
@@ -405,69 +405,72 @@ By Section~\ref{sec:geometric}, a SAM~3 pixel coordinate $(u,v)$ in the sRGB bra
 
 \subsubsection{Temporal Synchronization}
 
-SAM~3 produces discrete, per-frame annotations, while both event models of Section~\ref{sec:eventgen} produce continuous timestamps $t_k$. Both, however, are driven from the same underlying 119.88~fps frame clock:
+SAM~3 produces discrete observations at explicit frame times $t_k$. Synthetic events and RGB annotations share the same source clock, so their offset is zero by construction. Physical RGB/event pairs do not receive this assumption: a flash or blinking target visible to both sensors is used to estimate a single offset $\delta_t$ under the convention
 \begin{equation}
-t_i = i \cdot \Delta t_{frame}, \qquad \Delta t_{frame} \approx 8.34~\text{ms}.
-\label{eq:frameclock}
+t_{\mathrm{event}} = t_{\mathrm{RGB}} + \delta_t,
+\label{eq:clockoffset}
 \end{equation}
-Because both event models generate events strictly from the log-intensity transition between frame $i$ and frame $i{+}1$, every event resulting from that transition satisfies
+and the method, residual, confidence, source files, and timestamp units are stored with the result. A physical pairing without this artifact is rejected unless an explicit unsynchronized diagnostic override is requested.
+
+\subsubsection{Exact Observations and Causal Detector Windows}
+
+The detector sample indexed by $k$ ends at the exact SAM~3 observation time $t_k$ and uses the box/mask $B_k$ observed at that frame without interpolation:
 \begin{equation}
-t_k \in [t_i, t_{i+1}).
-\label{eq:temporalwindow}
+\mathcal{W}_k(\Delta T) =
+\left\{e_j \mid t_k-\Delta T \le t_j < t_k\right\},
+\qquad
+\mathcal{W}_k(\Delta T) \longrightarrow B_k.
+\label{eq:eventwindow}
 \end{equation}
-
-\subsubsection{Sub-Frame Position via Linear Interpolation}
-
-Rather than freezing an object's position for the full $\Delta t_{frame}$ interval, each tracked object's box (and, where available, its mask) is linearly interpolated between the two SAM~3 observations bracketing the event's own timestamp $t_k\in[t_i,t_{i+1})$:
+The half-open interval prevents an event at $t_k$ from appearing in both adjacent samples. More importantly, neither $B_{k+1}$ nor any event at or after $t_k$ can influence sample $k$:
 \begin{equation}
-\alpha = \frac{t_k - t_i}{t_{i+1}-t_i}, \qquad
-B_n(t_k) = (1-\alpha)\,B_{i,n} + \alpha\,B_{i+1,n},
-\label{eq:interp}
+\frac{\partial B_k}{\partial B_{k+1}} = 0,
+\qquad
+\mathcal{W}_k \cap \{e_j:t_j\ge t_k\}=\varnothing.
+\label{eq:causalpair}
 \end{equation}
-evaluated only when both $B_{i,n}$ and $B_{i+1,n}$ exist for the same track identity $n$ within a bounded gap of $G$ frames; a track absent from either endpoint, or separated from its neighboring observation by more than $G$ frames (indicating an occlusion SAM~3 did not bridge), is not interpolated across that gap, and events in that interval are left unassigned to $n$ rather than assigned to a linearly extrapolated position. Equation~\eqref{eq:interp} gives every event microsecond-resolution positional grounding despite the underlying annotation being produced at the discrete frame rate of Eq.~\eqref{eq:frameclock}.
+CAROECT-D evaluates $\Delta T\in\{8.34,16.7,33.3,50.0\}$~ms. These variants retain the same ordered ending times $t_k$ and the same labels $B_k$; only event-history length changes. Detector-window duration is independent of the 119.88~fps simulation input cadence.
 
-\subsubsection{The Label-Assignment Operator}
+\subsubsection{Bidirectional Track Construction}
 
-Combining the spatial identity of Eq.~\eqref{eq:identitymap} with the interpolated position of Eq.~\eqref{eq:interp} yields a single spatiotemporal inclusion test. An event $e_k=(x_k,y_k,t_k,p_k)$ is assigned object identity $ID_n$ if and only if it falls within object $n$'s interpolated mask (or, in the box-only variant, its interpolated bounding box $B_n(t_k)$) at its own timestamp:
+Forward and backward SAM~3 propagation are run as independent sessions, seeded at the first and last frames respectively, and both raw artifacts are retained. Same-class trajectories are associated using temporal overlap and mean IoU. At each frame the merge prioritizes temporal continuity, then confidence. Only when candidates remain otherwise comparable is a receding-trajectory score used as a tie-break; that score is derived from decreasing image area and motion toward a configured horizon, never from propagation direction. The chosen source and reason are recorded for audit, and cross-class suppression is applied only after directional merge.
+
+\subsubsection{Causal Label-Assignment Operator}
+
+Because the two synthetic branches share frozen geometry, the spatial map is the identity of Eq.~\eqref{eq:identitymap}. For each exact observation $B_k$, event indices are found with two monotone searches over sorted timestamps:
 \begin{equation}
-\mathrm{Assign}(e_k) =
-\begin{cases}
-ID_n, & (x_k, y_k) \in M_n(t_k) \\[4pt]
-\text{Background}, & \text{otherwise}
-\end{cases}
-\label{eq:assign}
+a_k = \operatorname{lower\_bound}(t, t_k-\Delta T),
+\qquad
+b_k = \operatorname{lower\_bound}(t, t_k).
+\label{eq:eventindices}
 \end{equation}
-where $M_n(t_k)$ denotes the mask (or box) of Eq.~\eqref{eq:interp} evaluated at $t_k$. When $(x_k,y_k)$ falls inside more than one object's interpolated region simultaneously, the assignment is resolved to the object with the smaller interpolated area at $t_k$, under the heuristic that a nearer or foreground object typically occupies a smaller image-plane footprint than the object it occludes in a roadside perspective; this is a heuristic tie-break rather than a depth-ordering guarantee, and its effect on label quality is quantified directly by the fraction of multiply-matched events reported at run time.
+The detector representation is built from events $e_{a_k},\ldots,e_{b_k-1}$ and paired with the unchanged observation $B_k$. No $\alpha$, bracket search, extrapolation, or per-event box interpolation appears in the training path.
 
-Algorithm~\ref{alg:labeltransfer} summarizes this procedure. Because the spatial term reduces to a point-in-mask test at an already-interpolated position and the temporal term is folded into Eq.~\eqref{eq:interp}, Eq.~\eqref{eq:assign} can be evaluated independently for every generated event, which parallelizes trivially across events or across frame intervals, at the cost of one interpolation per candidate track per event rather than a single frame-indexed lookup.
+Algorithm~\ref{alg:labeltransfer} summarizes the procedure.
 
 \begin{algorithm}[t]
-\caption{Cross-Modal Spatiotemporal Label Assignment}
+\caption{Causal Frame-Observation Label Transfer}
 \label{alg:labeltransfer}
 \begin{algorithmic}[1]
-\Require Event stream $\{e_k=(x_k,y_k,t_k,p_k)\}_{k=1}^{K}$; frame index sequence $\{i\}$ with clock $t_i = i \cdot \Delta t_{frame}$; per-frame confirmed SAM~3 masks $\{M_{i,n}\}$ for object identities $n$
-\Ensure Labeled event stream $\{(e_k, \ell_k)\}$, $\ell_k \in \{ID_1,\dots,ID_N,\text{Background}\}$
-\For{each event $e_k$}
-    \State $i \gets \lfloor t_k / \Delta t_{frame} \rfloor$ \Comment{Eq.~\eqref{eq:frameclock}--\eqref{eq:temporalwindow}}
-    \State $\ell_k \gets \text{Background}$
-    \For{each confirmed object $n$ at frame $i$}
-        \If{$(x_k, y_k) \in M_{i,n}$} \Comment{Eq.~\eqref{eq:identitymap}, identity spatial map}
-            \State $\ell_k \gets ID_n$
-            \State \textbf{break}
-        \EndIf
-    \EndFor
+\Require Sorted event stream $\{e_j\}_{j=1}^{K}$; exact frame times $\{t_k\}$; confirmed SAM~3 observations $\{B_k\}$; window duration $\Delta T$; optional physical offset $\delta_t$
+\Ensure Detector samples $\{(\mathcal{W}_k,B_k)\}$
+\For{each observed frame $k$}
+    \State $\hat t_k \gets t_k+\delta_t$ \Comment{$\delta_t=0$ for synthetic events}
+    \State $a_k \gets \operatorname{lower\_bound}(t,\hat t_k-\Delta T)$
+    \State $b_k \gets \operatorname{lower\_bound}(t,\hat t_k)$
+    \State $\mathcal{W}_k \gets \{e_j\mid a_k\le j<b_k\}$
+    \State emit $(\mathcal{W}_k,B_k)$ \Comment{copy exact observation; no interpolation}
 \EndFor
-\State \Return $\{(e_k,\ell_k)\}$
 \end{algorithmic}
 \end{algorithm}
 
-\textbf{Complexity.} For $K$ events and $N_i$ confirmed objects at frame $i$, the naive point-in-mask test costs $O\!\left(\sum_k N_{i(k)}\right)$ in the worst case; in practice $M_{i,n}$ is stored as a rasterized label map so that membership is an $O(1)$ array lookup per event, giving overall $O(K)$ label assignment independent of $N_i$, at the cost of $O(HW)$ memory per frame for the label map, where $H\times W$ is the shared $1280\times720$ resolution of Eq.~\eqref{eq:resize}.
+\textbf{Complexity.} For $K$ sorted events and $F$ observed frames, the two binary searches cost $O(F\log K)$ and each event slice is rendered once per requested window. Label lookup is frame-indexed rather than one interpolation per event/object candidate.
 
-\textbf{Advantages.} The procedure requires no per-sequence calibration search, degrades gracefully to \emph{Background} for any event outside a confirmed mask rather than producing a spurious assignment, and is agnostic to which of the two event-generation models of Section~\ref{sec:eventgen} produced $e_k$, so v2e-derived and DVS-Voltmeter-derived streams can be labeled with the same code path.
+\textbf{Advantages.} The procedure is explicitly causal, cannot leak a future observation into the current target, supports window-duration ablation without changing labels, and uses the same code path for v2e and DVS-Voltmeter. The physical path differs only by applying one measured clock offset before window construction.
 
-\textbf{Limitations.} The procedure inherits any localization error already present in the SAM~3 masks themselves (Section~\ref{sec:sam3} notes that SAM~3's behavior on low-light, linearized roadside sRGB frames is not established by its original training and evaluation domain); Eq.~\eqref{eq:interp} gives sub-frame positional resolution but not sub-frame \emph{shape} resolution, since the interpolated mask is a linear blend of two discretely-observed masks rather than a re-segmentation at $t_k$, so rapid non-rigid deformation (a turning vehicle, an articulating pedestrian) within one $\Delta t_{frame}\approx8.34$~ms window is smoothed rather than tracked exactly; and the smallest-interpolated-area tie-break for overlapping masks (Section~\ref{sec:labeltransfer}) is a heuristic rather than a depth-ordering guarantee, distinct from the Intersection-over-Minimum ambiguity handling SAM~3 applies internally to its own mask predictions \cite{carion2025sam3}.
+\textbf{Limitations.} Each target has the temporal granularity of a genuine SAM~3 observation; it does not claim sub-frame object shape or position. Label quality still inherits SAM~3 localization and tracking errors, and real physical pairing inherits synchronization residual and RGB/event registration error. These quantities must therefore be reported rather than concealed by interpolation.
 
-\textbf{Summary and connection to Experiments.} Sections~\ref{sec:radiometric}--\ref{sec:labeltransfer} establish, in order, why the pipeline must operate in a 16-bit linear radiometric domain, why geometric undistortion must be computed once and shared rather than recomputed per branch, how two physically distinct event-generation models are derived from that shared linear volume and subsequently fit to the physical Triton2 sensor rather than used at their published defaults, and how the resulting synthetic event stream receives dense automatic labels without manual annotation or physical cross-sensor calibration. This methodology fixes the representation that downstream detector training and domain-transfer evaluation, described in a subsequent report, will operate on; the open questions flagged above -- SAM~3 behavior under linearized low-light conditions, the relative fidelity of the two event-generation models against the physical Triton2 sensor, and quantitative closure of the sim-to-real gap discussed in Section~\ref{sec:relwork} -- are precisely the questions that report is designed to answer empirically.
+\textbf{Summary and connection to Experiments.} The methodology operates on a DaVinci-linearized 16-bit Rec.709 working signal, applies shared geometry once, simulates events with two named models under isolated conditions, constructs independent bidirectional SAM~3 tracks, and pairs exact frame observations with causal event windows. Detector representations use one train-derived count scale across default, calibrated, and real conditions so every checkpoint remains traceable to a dataset manifest.
 
 \section*{Acknowledgment}
 [Citation Needed: funding and acknowledgment text withheld pending author input.]

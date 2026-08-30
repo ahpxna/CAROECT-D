@@ -52,13 +52,21 @@ from sam3.model_builder import build_sam3_video_predictor
 from linear16_to_srgb8 import guard_reject_16bit_path, Unexpected16BitInputError
 
 
-def propagate_in_video(predictor, session_id):
-    """Verbatim pattern from facebookresearch/sam3's own
-    sam3_video_predictor_example.ipynb (Cell 10) - not our invention.
-    Streams one response per frame; we collect them all into a dict."""
+def propagate_in_video(predictor, session_id, direction):
+    """Propagate with an explicit official SAM3 direction.
+
+    direction must be one of both, forward, or backward. Callers performing
+    the paper-aligned merge run forward and backward separately.
+    """
+    if direction not in {"both", "forward", "backward"}:
+        raise ValueError(f"Invalid SAM3 propagation direction: {direction!r}")
     outputs_per_frame = {}
     for response in predictor.handle_stream_request(
-        request=dict(type="propagate_in_video", session_id=session_id)
+        request=dict(
+            type="propagate_in_video",
+            session_id=session_id,
+            propagation_direction=direction,
+        )
     ):
         outputs_per_frame[response["frame_index"]] = response["outputs"]
     return outputs_per_frame
@@ -79,7 +87,7 @@ def load_sorted_frame_paths(folder: str, check_8bit: bool = True):
     to_sam3.py's encode_srgb_u8() step. Without this, PIL's own
     Image.open(...).convert('RGB') would silently do an uncontrolled linear
     truncation on 16-bit input (see linear16_to_srgb8.py docstring) — the
-    exact "SAM3 tự áp xuống 8-bit không kiểm soát được" risk this guards
+    exact uncontrolled SAM3-side 16-to-8-bit conversion risk this guards
     against."""
     paths = []
     for ext in ("*.tif", "*.tiff"):
@@ -157,6 +165,8 @@ def main():
     ap.add_argument("--output-dir", required=True, help="Where to write labels/ and overlay/")
     ap.add_argument("--score-threshold", type=float, default=0.3)
     ap.add_argument("--class-id", type=int, default=0, help="YOLO class id for this prompt")
+    ap.add_argument("--direction", choices=["both", "forward", "backward"], default="both",
+                    help="Explicit SAM3 propagation direction")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -188,7 +198,7 @@ def main():
     frame0_out = response["outputs"]
 
     print("Propagating across all frames (this is the step sam3_test.py was missing)...")
-    outputs_per_frame = propagate_in_video(predictor, session_id)
+    outputs_per_frame = propagate_in_video(predictor, session_id, args.direction)
     # frame 0 comes from add_prompt's own response; propagate_in_video covers
     # the rest, but also re-includes frame 0 in most SAM3 versions - if it's
     # present here too we let it overwrite frame0_out (should be identical).

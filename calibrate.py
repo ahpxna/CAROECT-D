@@ -26,6 +26,8 @@ import numpy as np
 import tifffile
 import yaml
 import argparse
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -35,7 +37,11 @@ def load_config(path="config.yaml"):
 
 
 def decode_transfer(rgb: np.ndarray, transfer: str) -> np.ndarray:
-    """Match preprocess.py: convert encoded TIFF values to scene-linear 0..65535."""
+    """Convert values to linear scale for isolated compatibility tests.
+
+    The aligned workflow supplies DaVinci-linearized SDR TIFFs and therefore
+    uses only the ``linear`` branch.
+    """
     if transfer == "linear":
         return rgb
     if transfer == "srgb":
@@ -137,21 +143,47 @@ def run(cfg):
     calib_dir.mkdir(parents=True, exist_ok=True)
     c = cfg["calibration"]
     transfer = cfg.get("camera", {}).get("input_transfer", "linear")
+    if transfer != "linear":
+        raise ValueError(
+            "Calibration references must follow the same DaVinci-linearized SDR "
+            "export path as footage; camera.input_transfer must be 'linear'.")
 
     print(f"\n{'━'*45}\n  CAROECT-D Calibration\n{'━'*45}")
     print(f"  [Transfer] calibration TIFFs interpreted as {transfer!r}, same as footage")
+    corrections = {}
+    references = {}
 
     dark_mean = None
     dark_path = calib_dir / "dark"
     if dark_path.exists() and any(dark_path.glob("*.tiff")):
         dark_mean = compute_dark_mean(str(dark_path), transfer)
         np.save(calib_dir / "dark_mean.npy", dark_mean)
+        references["dark"] = {
+            "type": "dark_no_light",
+            "path": str(dark_path),
+            "frames": len(list(dark_path.glob("*.tiff"))),
+        }
+        corrections["residual_offset"] = {
+            "valid": True,
+            "artifact": "dark_mean.npy",
+            "meaning": "residual offset diagnostic/correction from no-light frames",
+        }
     else:
         print("  [Dark]  skipped (no frames)")
 
     flat_path = calib_dir / "flat"
     if flat_path.exists() and any(flat_path.glob("*.tiff")):
         np.save(calib_dir / "gain_map.npy", compute_gain_map(str(flat_path), dark_mean, transfer))
+        references["flat_field"] = {
+            "type": "homogeneous_nonzero_field",
+            "path": str(flat_path),
+            "frames": len(list(flat_path.glob("*.tiff"))),
+        }
+        corrections["relative_gain_prnu"] = {
+            "valid": True,
+            "artifact": "gain_map.npy",
+            "meaning": "relative gain/PRNU from a homogeneous non-zero field",
+        }
     else:
         print("  [Flat]  skipped (no frames)")
 
@@ -160,6 +192,16 @@ def run(cfg):
         roi = c.get("gray_card_roi")
         gains = compute_wb_gains(str(gray_card), roi, transfer)
         np.save(calib_dir / "wb_gains.npy", gains)
+        references["gray_card"] = {
+            "type": "measured_neutral_reference",
+            "path": str(gray_card),
+            "roi": roi,
+        }
+        corrections["white_balance"] = {
+            "valid": True,
+            "artifact": "wb_gains.npy",
+            "meaning": "measured neutral-reference channel gains",
+        }
 
         # ── Exposure normalization (reuses the SAME gray card shot) ──────
         # WHY: the same 18%-gray card on two different sessions reads
@@ -184,15 +226,27 @@ def run(cfg):
         np.save(calib_dir / "exposure_level.npy", np.array(exposure_level, dtype=np.float32))
 
         target_path = calib_dir / "exposure_target.npy"
-        if not target_path.exists():
-            np.save(target_path, np.array(exposure_level, dtype=np.float32))
-            print(f"  [Exposure] {exposure_level:.1f}  <- bootstrapped as the project-wide "
-                  f"canonical target (first-ever calibration). Never overwritten again.")
-        else:
-            target = float(np.load(target_path))
+        measured_target = c.get("exposure_reference_level")
+        if measured_target is not None:
+            target = float(measured_target)
+            np.save(target_path, np.array(target, dtype=np.float32))
             scalar = target / exposure_level if exposure_level > 0 else 1.0
             print(f"  [Exposure] {exposure_level:.1f}  (target={target:.1f}, "
                   f"this session's preprocess scalar will be x{scalar:.4f})")
+            corrections["exposure_normalization"] = {
+                "valid": True,
+                "artifact": "exposure_level.npy",
+                "target_artifact": "exposure_target.npy",
+                "meaning": "normalization to an explicitly measured reference",
+            }
+        else:
+            print("  [Exposure] diagnostic level saved; normalization remains invalid "
+                  "until calibration.exposure_reference_level is explicitly provided.")
+            corrections["exposure_normalization"] = {
+                "valid": False,
+                "artifact": "exposure_level.npy",
+                "meaning": "diagnostic only; no measured reference target configured",
+            }
     else:
         print("  [WB]    skipped (no gray_card.tiff)")
         print("  [Exposure] skipped (needs the same gray_card.tiff)")
@@ -205,6 +259,29 @@ def run(cfg):
         np.savez(calib_dir / "camera_params.npz", K=K, D=D, image_size=np.array(image_size))
     else:
         print("  [Calib] skipped (no chessboard dir)")
+
+    levels_dir = calib_dir / c.get("linearity_levels_dir", "linearity")
+    level_files = sorted(levels_dir.glob("*.tiff")) if levels_dir.exists() else []
+    references["linearity"] = {
+        "type": "multiple_nonzero_levels",
+        "path": str(levels_dir),
+        "frames": len(level_files),
+        "valid": len(level_files) >= 3,
+        "note": "Validation evidence only; no automatic correction is derived.",
+    }
+
+    manifest = {
+        "schema_version": 1,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "acquisition_decode": c.get("acquisition", {}),
+        "input_transfer": transfer,
+        "working_primaries": cfg.get("camera", {}).get("working_primaries"),
+        "references": references,
+        "corrections": corrections,
+    }
+    manifest_path = calib_dir / "calibration_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"  [Manifest] {manifest_path}")
 
     print(f"\n✓ Calibration saved to: {calib_dir}/\n")
 
