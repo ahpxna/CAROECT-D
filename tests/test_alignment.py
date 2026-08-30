@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import unittest
@@ -23,18 +24,38 @@ def test_causal_window_boundary_is_half_open():
 
 def _tracks(box_at_k, box_at_future):
     return {"track": {"class_id": 0, "by_frame": {
-        0: {"cx": box_at_k, "cy": 0.5, "w": 0.2, "h": 0.1},
-        1: {"cx": box_at_future, "cy": 0.5, "w": 0.2, "h": 0.1},
+        1: {"cx": box_at_k, "cy": 0.5, "w": 0.2, "h": 0.1},
+        2: {"cx": box_at_future, "cy": 0.5, "w": 0.2, "h": 0.1},
     }}}
 
 
 def test_frame_k_label_has_no_future_frame_influence():
     from label_transfer import build_causal_windows
-    times = np.array([1000, 2000])
+    times = np.array([0, 1000, 2000])
     first = build_causal_windows(times, _tracks(0.25, 0.50), 1000)
     changed_future = build_causal_windows(times, _tracks(0.25, 0.95), 1000)
+    assert first[0]["frame_idx"] == 1
     assert first[0]["boxes"][0] == changed_future[0]["boxes"][0]
     assert first[0]["boxes"][0]["cx"] == 0.25
+
+
+def test_causal_windows_skip_incomplete_prefix_history():
+    from label_transfer import build_causal_windows
+    times = np.array([0, 1000, 2000, 3000])
+    windows = build_causal_windows(times, {}, 2000)
+    assert [row["frame_idx"] for row in windows] == [2, 3]
+    assert [row["sample_index"] for row in windows] == [0, 1]
+    assert windows[0]["t_start_us"] == 0
+
+
+def test_synthetic_clock_alignment_rejects_sync_override():
+    from label_transfer import resolve_clock_alignment
+    with CASE.assertRaises(ValueError):
+        resolve_clock_alignment({"simulator": "v2e"}, "should-not-be-used.json", False)
+    synthetic, offset, payload = resolve_clock_alignment({"simulator": "v2e"}, None, False)
+    assert synthetic is True
+    assert offset == 0.0
+    assert payload is None
 
 
 def test_fixed_count_scale_preserves_amplitude_below_clip():
@@ -42,6 +63,35 @@ def test_fixed_count_scale_preserves_amplitude_below_clip():
     one = int(encode_count_u8(np.array([2]), 10)[0])
     doubled = int(encode_count_u8(np.array([4]), 10)[0])
     assert abs(doubled - 2 * one) <= 1
+
+
+
+
+def test_representation_manifest_records_fit_source_and_rejects_stale(tmp_path):
+    from build_event_dataset import resolve_representation
+    representation = tmp_path / "representation.json"
+    args = SimpleNamespace(
+        representation=str(representation),
+        split="train",
+        count_clip=10.0,
+        count_clip_percentile=99.5,
+        events=str(tmp_path / "events.h5"),
+        windows=str(tmp_path / "windows.json"),
+        site_id="site-a",
+    )
+    payload = {"window_us": 1000.0, "width": 4, "height": 3, "windows": []}
+    events = {key: np.array([], dtype=np.float64) for key in ("x", "y", "t", "p")}
+    manifest, path = resolve_representation(args, events, payload, tmp_path)
+    assert path == representation
+    assert manifest["frozen_after_fit"] is True
+    assert manifest["fit_source"]["site_id"] == "site-a"
+    assert manifest["fit_source"]["events"] == str(Path(args.events).resolve())
+
+    stale = dict(manifest)
+    stale.pop("fit_source")
+    representation.write_text(json.dumps(stale))
+    with CASE.assertRaises(ValueError):
+        resolve_representation(args, events, payload, tmp_path)
 
 
 def test_native_shape_and_letterbox_preserve_rectangle_ratio():
@@ -157,7 +207,10 @@ if __name__ == "__main__":
         if not name.startswith("test_") or not callable(function):
             continue
         try:
-            if name == "test_cached_event_intrinsics_without_rms":
+            if name in {
+                "test_cached_event_intrinsics_without_rms",
+                "test_representation_manifest_records_fit_source_and_rejects_stale",
+            }:
                 with tempfile.TemporaryDirectory() as directory:
                     function(Path(directory))
             else:

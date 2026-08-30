@@ -79,6 +79,26 @@ def load_sync_offset(sync_json: str | None) -> tuple[float, dict | None]:
     return float(payload["offset_us"]), payload
 
 
+def resolve_clock_alignment(attrs: dict, sync_json: str | None, allow_unsynced: bool):
+    """Resolve RGB->event clock mapping without permitting synthetic offsets."""
+    synthetic = is_synthetic_event_file(attrs)
+    if synthetic:
+        if sync_json is not None:
+            raise ValueError(
+                "--sync-json is invalid for synthetic events: their RGB/event "
+                "clock offset is zero by construction"
+            )
+        return True, 0.0, None
+
+    offset_us, sync_payload = load_sync_offset(sync_json)
+    if sync_payload is None and not allow_unsynced:
+        raise RuntimeError(
+            "Physical RGB/event pairing requires --sync-json. Pass --allow-unsynced "
+            "only when deliberately accepting an unmeasured zero offset."
+        )
+    return False, offset_us, sync_payload
+
+
 def build_causal_windows(
     frame_times_us: np.ndarray,
     tracks: dict,
@@ -88,8 +108,17 @@ def build_causal_windows(
     """Create [t_k-window_us, t_k) samples with exact frame-k observations."""
     if window_us <= 0:
         raise ValueError("window_us must be positive")
+    frame_times = np.asarray(frame_times_us, dtype=np.float64)
+    if not len(frame_times):
+        return []
+    clip_start_rgb_us = float(frame_times[0])
     windows = []
-    for frame_idx, rgb_t_us in enumerate(np.asarray(frame_times_us)):
+    for frame_idx, rgb_t_us in enumerate(frame_times):
+        # A causal sample is valid only when the RGB source contains the full
+        # requested history. Do not create positive labels over a padded/empty
+        # pre-roll before the clip starts.
+        if float(rgb_t_us) - clip_start_rgb_us < float(window_us):
+            continue
         end_us = float(rgb_t_us) + float(offset_us)
         boxes = []
         for track_id in sorted(tracks):
@@ -112,7 +141,7 @@ def build_causal_windows(
             }
             boxes.append(box)
         windows.append({
-            "sample_index": frame_idx,
+            "sample_index": len(windows),
             "frame_idx": frame_idx,
             "rgb_t_us": int(rgb_t_us),
             "t_start_us": end_us - float(window_us),
@@ -201,7 +230,14 @@ def main() -> None:
     parser.add_argument("--events", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--window-us", type=float, required=True)
-    parser.add_argument("--max-gap-frames", type=int, default=5)
+    parser.add_argument(
+        "--legacy-max-gap-frames",
+        "--max-gap-frames",
+        dest="legacy_max_gap_frames",
+        type=int,
+        default=5,
+        help="LEGACY DEBUG ONLY: maximum interpolation gap in RGB frames",
+    )
     parser.add_argument("--sync-json")
     parser.add_argument(
         "--allow-unsynced",
@@ -218,18 +254,14 @@ def main() -> None:
 
     fps, width, height, frame_times, tracks, tracks_payload = load_tracks(args.tracks)
     events, attrs = load_events_h5(args.events)
-    synthetic = is_synthetic_event_file(attrs)
-    offset_us, sync_payload = load_sync_offset(args.sync_json)
-    if not synthetic and sync_payload is None and not args.allow_unsynced:
-        raise RuntimeError(
-            "Physical RGB/event pairing requires --sync-json. Pass --allow-unsynced "
-            "only when deliberately accepting an unmeasured zero offset."
-        )
+    synthetic, offset_us, sync_payload = resolve_clock_alignment(
+        attrs, args.sync_json, args.allow_unsynced
+    )
 
     if args.legacy_interpolation:
         windows = build_legacy_interpolated_windows(
             frame_times, tracks, args.window_us,
-            args.max_gap_frames * 1e6 / fps, offset_us,
+            args.legacy_max_gap_frames * 1e6 / fps, offset_us,
         )
         label_semantics = "legacy_interpolated_debug"
     else:

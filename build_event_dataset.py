@@ -217,6 +217,14 @@ def resolve_representation(args, events, payload, root):
             raise ValueError(f"Incompatible representation manifest: {path}")
         if float(representation["window_us"]) != float(payload["window_us"]):
             raise ValueError("Representation window_us does not match windows.json")
+        fit_source = representation.get("fit_source")
+        if not isinstance(fit_source, dict) or not fit_source.get("events") or not fit_source.get("windows"):
+            raise ValueError(
+                f"Representation manifest {path} predates fit-source provenance. "
+                "Delete/regenerate it from an explicit training source before reuse."
+            )
+        if representation.get("frozen_after_fit") is not True:
+            raise ValueError(f"Representation manifest is not marked frozen: {path}")
         return representation, path
     if args.split != "train":
         raise RuntimeError(
@@ -238,6 +246,14 @@ def resolve_representation(args, events, payload, root):
         "shared_on_off_scale": True,
         "window_us": float(payload["window_us"]),
         "interval": "[t_k-window_us,t_k)",
+        "fit_method": "explicit_count_clip" if args.count_clip is not None else "positive_count_percentile",
+        "fit_source": {
+            "events": str(Path(args.events).resolve()),
+            "windows": str(Path(args.windows).resolve()),
+            "site_id": args.site_id,
+            "split": args.split,
+        },
+        "frozen_after_fit": True,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(representation, indent=2))
