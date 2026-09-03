@@ -42,9 +42,9 @@ preprocessing:
   denoise_bilateral_sigma: 0.02
 
 calibration:
-  gray_card_roi: null
-  board_cols: 9
-  board_rows: 6
+  gray_card_roi: [1951, 792, 131, 178]
+  board_cols: 7
+  board_rows: 7
   square_size_m: 0.025
   # Capture/decode details are copied into calibration_manifest.json.
   acquisition:

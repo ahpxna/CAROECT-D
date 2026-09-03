@@ -121,12 +121,18 @@ def calibrate_camera(chess_dir: str, board_cols: int, board_rows: int, square_m:
             continue
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         image_size = gray.shape[::-1]                # (w, h)
-        ret, corners = cv2.findChessboardCorners(gray, board_size, None)
+        ret, corners = cv2.findChessboardCornersSB(
+            gray,
+            board_size,
+            flags=cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE
+        )
+
         if not ret:
             continue
-        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
-        c2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), crit)
-        obj_pts.append(objp); img_pts.append(c2); found += 1
+
+        obj_pts.append(objp)
+        img_pts.append(corners)
+        found += 1
 
     if found < 5:
         raise RuntimeError(f"Only {found} valid boards — need >= 5.")

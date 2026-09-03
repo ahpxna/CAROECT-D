@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "representation": "/home/duolu/Downloads/CAROECT-D-main(1)/CAROECT-D-main/data/event_dataset/test_v2e/representation.json",
+  "sources": [
+    {
+      "site_id": "test_v2e",
+      "split": "train",
+      "events": "/home/duolu/Downloads/CAROECT-D-main(1)/CAROECT-D-main/data/events/test_v2e/events.h5",
+      "windows": "/home/duolu/Downloads/CAROECT-D-main(1)/CAROECT-D-main/data/sam3/test/windows_v2e.json",
+      "window_us": 8341.675,
+      "interval": "[t_{k-1},t_k)",
+      "window_definition": "adjacent_rgb_frame_timestamps",
+      "sample_metadata": "/home/duolu/Downloads/CAROECT-D-main(1)/CAROECT-D-main/data/event_dataset/test_v2e/train/test_v2e_samples.json",
+      "coco_annotations": "/home/duolu/Downloads/CAROECT-D-main(1)/CAROECT-D-main/data/event_dataset/test_v2e/annotations/instances_train.json"
+    }
+  ]
+}

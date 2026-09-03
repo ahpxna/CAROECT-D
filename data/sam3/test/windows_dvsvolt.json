@@ -1,0 +1,632 @@
+{
+  "schema_version": 2,
+  "fps": 119.88,
+  "fps_provenance": "camera.fps_original from config.yaml",
+  "width": 1280,
+  "height": 720,
+  "n_frames": 10,
+  "window_us": 8341.675,
+  "interval": "[t_{k-1},t_k)",
+  "window_definition": "adjacent_rgb_frame_timestamps",
+  "label_semantics": "causal_exact_frame_observation",
+  "clock_alignment": {
+    "offset_us": 0.0,
+    "convention": "event_time_us = rgb_time_us + offset_us",
+    "source": "synthetic_zero_by_construction"
+  },
+  "tracks_base_dir": "/home/duolu/Downloads/CAROECT-D-main(1)/CAROECT-D-main/data/sam3/test",
+  "windows": [
+    {
+      "sample_index": 0,
+      "frame_idx": 1,
+      "rgb_t_us": 8342,
+      "t_start_us": 0.0,
+      "t_end_us": 8342.0,
+      "label_time_us": 8342.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000001_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.37812501192092896,
+          "cy": 0.4625000171363354,
+          "w": 0.1015625,
+          "h": 0.10555555671453476,
+          "mask_path": "masks/000001_c0_backward_o3.png",
+          "score": 0.9532163739204407,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.1847656313329935,
+          "cy": 0.4180555772036314,
+          "w": 0.03828125074505806,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000001_c0_backward_o1.png",
+          "score": 0.8904109597206116,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000001_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16406250931322575,
+          "cy": 0.4111111108213663,
+          "w": 0.02656250074505806,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000001_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 0,
+      "event_index_end": 1181,
+      "n_events": 1181
+    },
+    {
+      "sample_index": 1,
+      "frame_idx": 2,
+      "rgb_t_us": 16683,
+      "t_start_us": 8342.0,
+      "t_end_us": 16683.0,
+      "label_time_us": 16683.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000002_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.3785156384110451,
+          "cy": 0.4625000171363354,
+          "w": 0.10234375298023224,
+          "h": 0.10555555671453476,
+          "mask_path": "masks/000002_c0_forward_o4.png",
+          "score": 0.9532163739204407,
+          "sam_source": "forward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.18515625596046448,
+          "cy": 0.4180555772036314,
+          "w": 0.0390625,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000002_c0_forward_o3.png",
+          "score": 0.8750000596046448,
+          "sam_source": "forward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000002_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16445313394069672,
+          "cy": 0.4111111108213663,
+          "w": 0.02734375,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000002_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 1181,
+      "event_index_end": 3191,
+      "n_events": 2010
+    },
+    {
+      "sample_index": 2,
+      "frame_idx": 3,
+      "rgb_t_us": 25025,
+      "t_start_us": 16683.0,
+      "t_end_us": 25025.0,
+      "label_time_us": 25025.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000003_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.37968751788139343,
+          "cy": 0.46319446340203285,
+          "w": 0.1015625,
+          "h": 0.10694444924592972,
+          "mask_path": "masks/000003_c0_backward_o3.png",
+          "score": 0.9532163739204407,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.18554688431322575,
+          "cy": 0.4180555772036314,
+          "w": 0.03828125074505806,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000003_c0_backward_o1.png",
+          "score": 0.8904109597206116,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000003_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16406250931322575,
+          "cy": 0.4111111108213663,
+          "w": 0.02656250074505806,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000003_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 3191,
+      "event_index_end": 5357,
+      "n_events": 2166
+    },
+    {
+      "sample_index": 3,
+      "frame_idx": 4,
+      "rgb_t_us": 33367,
+      "t_start_us": 25025.0,
+      "t_end_us": 33367.0,
+      "label_time_us": 33367.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000004_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.3804687559604645,
+          "cy": 0.46319446340203285,
+          "w": 0.1015625,
+          "h": 0.10694444924592972,
+          "mask_path": "masks/000004_c0_backward_o3.png",
+          "score": 0.9532163739204407,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.18554688431322575,
+          "cy": 0.4180555772036314,
+          "w": 0.03828125074505806,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000004_c0_backward_o1.png",
+          "score": 0.8904109597206116,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000004_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16406250931322575,
+          "cy": 0.4111111108213663,
+          "w": 0.02656250074505806,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000004_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 5357,
+      "event_index_end": 7614,
+      "n_events": 2257
+    },
+    {
+      "sample_index": 4,
+      "frame_idx": 5,
+      "rgb_t_us": 41708,
+      "t_start_us": 33367.0,
+      "t_end_us": 41708.0,
+      "label_time_us": 41708.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000005_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.3812499940395355,
+          "cy": 0.46319446340203285,
+          "w": 0.1015625,
+          "h": 0.10694444924592972,
+          "mask_path": "masks/000005_c0_backward_o3.png",
+          "score": 0.9532163739204407,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.18593750894069672,
+          "cy": 0.4180555772036314,
+          "w": 0.0390625,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000005_c0_backward_o1.png",
+          "score": 0.8904109597206116,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000005_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16406250931322575,
+          "cy": 0.4111111108213663,
+          "w": 0.02656250074505806,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000005_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 7614,
+      "event_index_end": 9850,
+      "n_events": 2236
+    },
+    {
+      "sample_index": 5,
+      "frame_idx": 6,
+      "rgb_t_us": 50050,
+      "t_start_us": 41708.0,
+      "t_end_us": 50050.0,
+      "label_time_us": 50050.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000006_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.38164062052965164,
+          "cy": 0.46319446340203285,
+          "w": 0.10234375298023224,
+          "h": 0.10694444924592972,
+          "mask_path": "masks/000006_c0_forward_o4.png",
+          "score": 0.9532163739204407,
+          "sam_source": "forward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.18593750894069672,
+          "cy": 0.4180555772036314,
+          "w": 0.0390625,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000006_c0_forward_o3.png",
+          "score": 0.8750000596046448,
+          "sam_source": "forward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000006_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16406249720603228,
+          "cy": 0.4111111108213663,
+          "w": 0.02500000037252903,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000006_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 9850,
+      "event_index_end": 12124,
+      "n_events": 2274
+    },
+    {
+      "sample_index": 6,
+      "frame_idx": 7,
+      "rgb_t_us": 58392,
+      "t_start_us": 50050.0,
+      "t_end_us": 58392.0,
+      "label_time_us": 58392.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000007_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.3832031264901161,
+          "cy": 0.4645833410322666,
+          "w": 0.10234375298023224,
+          "h": 0.10694444924592972,
+          "mask_path": "masks/000007_c0_backward_o3.png",
+          "score": 0.9532163739204407,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.1863281223922968,
+          "cy": 0.4180555772036314,
+          "w": 0.03828125074505806,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000007_c0_backward_o1.png",
+          "score": 0.8904109597206116,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000007_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16406249720603228,
+          "cy": 0.4111111108213663,
+          "w": 0.02500000037252903,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000007_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 12124,
+      "event_index_end": 14478,
+      "n_events": 2354
+    },
+    {
+      "sample_index": 7,
+      "frame_idx": 8,
+      "rgb_t_us": 66733,
+      "t_start_us": 58392.0,
+      "t_end_us": 66733.0,
+      "label_time_us": 66733.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000008_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.38398439437150955,
+          "cy": 0.46388890594244003,
+          "w": 0.10234375298023224,
+          "h": 0.10833333432674408,
+          "mask_path": "masks/000008_c0_backward_o3.png",
+          "score": 0.9532163739204407,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.1863281223922968,
+          "cy": 0.4180555772036314,
+          "w": 0.03828125074505806,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000008_c0_backward_o1.png",
+          "score": 0.8904109597206116,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000008_c0_backward_o2.png",
+          "score": 0.7538461089134216,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16406249720603228,
+          "cy": 0.4111111108213663,
+          "w": 0.02500000037252903,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000008_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 14478,
+      "event_index_end": 16866,
+      "n_events": 2388
+    },
+    {
+      "sample_index": 8,
+      "frame_idx": 9,
+      "rgb_t_us": 75075,
+      "t_start_us": 66733.0,
+      "t_end_us": 75075.0,
+      "label_time_us": 75075.0,
+      "boxes": [
+        {
+          "track_id": "0_merged_0",
+          "class_id": 0,
+          "cx": 0.9785156138241291,
+          "cy": 0.44513890892267227,
+          "w": 0.04140625149011612,
+          "h": 0.05694444477558136,
+          "mask_path": "masks/000009_c0_backward_o0.png",
+          "score": 0.9179486632347107,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_1",
+          "class_id": 0,
+          "cx": 0.3843750171363354,
+          "cy": 0.4645833410322666,
+          "w": 0.10312499850988388,
+          "h": 0.10694444924592972,
+          "mask_path": "masks/000009_c0_backward_o3.png",
+          "score": 0.9532163739204407,
+          "sam_source": "backward"
+        },
+        {
+          "track_id": "0_merged_2",
+          "class_id": 0,
+          "cx": 0.18671874701976776,
+          "cy": 0.4180555772036314,
+          "w": 0.0390625,
+          "h": 0.04722222313284874,
+          "mask_path": "masks/000009_c0_forward_o3.png",
+          "score": 0.8750000596046448,
+          "sam_source": "forward"
+        },
+        {
+          "track_id": "0_merged_3",
+          "class_id": 0,
+          "cx": 0.134765628259629,
+          "cy": 0.3916666703298688,
+          "w": 0.010156250558793545,
+          "h": 0.01944444514811039,
+          "mask_path": "masks/000009_c0_forward_o0.png",
+          "score": 0.7538461089134216,
+          "sam_source": "forward"
+        },
+        {
+          "track_id": "0_merged_4",
+          "class_id": 0,
+          "cx": 0.16445312183350325,
+          "cy": 0.4111111108213663,
+          "w": 0.02578124962747097,
+          "h": 0.05000000074505806,
+          "mask_path": "masks/000009_c0_backward_o4.png",
+          "score": 0.6483516097068787,
+          "sam_source": "backward"
+        }
+      ],
+      "event_index_start": 16866,
+      "event_index_end": 19209,
+      "n_events": 2343
+    }
+  ]
+}

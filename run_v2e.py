@@ -248,54 +248,77 @@ def run_cli(repo: Path, paths, v: dict, seed: int, fps: float,
 #  both simulator runners independently executable.
 # ══════════════════════════════════════════════════════════════════════════
 
-def normalize_events(arr, width: int, height: int, dur_us_hint: float):
+def normalize_events(arr, width: int, height: int, dur_us_hint: float, mode: str):
+    """
+    Normalize v2e events to CAROECT-D unified schema.
+
+    v2e EventEmulator.generate_events() returns:
+        [timestamp_seconds, x, y, polarity]
+
+    v2e CLI HDF5 returns:
+        [timestamp_microseconds, x, y, polarity]
+
+    Output:
+        x uint16
+        y uint16
+        t uint64 microseconds
+        p uint8 {0,1}
+    """
     a = np.asarray(arr, dtype=np.float64)
+
     if a.ndim != 2 or a.shape[1] != 4:
         raise ValueError(f"Expected an Nx4 array, got {a.shape}")
-    cols = set(range(4))
 
-    p_col = next((c for c in cols
-                  if set(np.unique(a[:, c]).astype(np.int64).tolist()) <= {-1, 0, 1}), None)
-    if p_col is None:
-        raise ValueError("Could not identify a {-1,0,1} polarity column")
-    cols.discard(p_col)
+    # v2e's documented/fixed event layout
+    t = a[:, 0].copy()
+    x = a[:, 1].copy()
+    y = a[:, 2].copy()
+    p_raw = a[:, 3].copy()
 
-    t_col, best = None, -1.0
-    for c in cols:
-        d = np.diff(a[:, c])
-        if d.size == 0 or d.min() >= 0:
-            r = a[:, c].max() - a[:, c].min()
-            if r > best:
-                best, t_col = r, c
-    if t_col is None:                                   # Unusual non-monotonic fallback.
-        t_col = max(cols, key=lambda c: a[:, c].max())
-    cols.discard(t_col)
-
-    c1, c2 = sorted(cols)
-    if a[:, c1].max() >= height > a[:, c2].max():
-        x_col, y_col = c1, c2
-    elif a[:, c2].max() >= height > a[:, c1].max():
-        x_col, y_col = c2, c1
-    else:
-        x_col, y_col = c1, c2                           # Ambiguous: preserve order and log it.
-
-    t = a[:, t_col].copy()
-    unit = "µs"
-    if dur_us_hint and (t.max() - t.min()) < dur_us_hint / 1000.0:
+    # Library EventEmulator returns timestamps in seconds.
+    # CLI HDF5 already stores timestamps in microseconds.
+    if mode == "lib":
         t *= 1e6
         unit = "s→µs"
+    else:
+        unit = "µs"
 
-    p = np.where(a[:, p_col] > 0, 1, 0).astype(np.uint8)
+    # ±1 or 0/1 -> unified 0/1
+    p = np.where(p_raw > 0, 1, 0).astype(np.uint8)
+
+    # Validate coordinates before clipping.
+    if len(x):
+        if x.min() < 0 or x.max() >= width:
+            raise ValueError(
+                f"x outside sensor bounds: min={x.min()} max={x.max()} width={width}"
+            )
+
+        if y.min() < 0 or y.max() >= height:
+            raise ValueError(
+                f"y outside sensor bounds: min={y.min()} max={y.max()} height={height}"
+            )
+
     order = np.argsort(t, kind="stable")
 
-    print(f"  [norm] inferred columns: t=c{t_col}({unit})  x=c{x_col}  y=c{y_col}  p=c{p_col}"
-          f"   |  {len(t):,} events, {t.max()/1e6 - t.min()/1e6:.2f}s")
-    x = np.clip(np.rint(a[order, x_col]), 0, width - 1).astype(np.uint16)
-    y = np.clip(np.rint(a[order, y_col]), 0, height - 1).astype(np.uint16)
-    return dict(x=x,
-                y=y,
-                t=t[order].astype(np.uint64),
-                p=p[order])
+    x = np.rint(x[order]).astype(np.uint16)
+    y = np.rint(y[order]).astype(np.uint16)
+    t = np.rint(t[order]).astype(np.uint64)
+    p = p[order]
+
+    duration_s = (float(t[-1]) - float(t[0])) / 1e6 if len(t) > 1 else 0.0
+
+    print(
+        f"  [norm] fixed v2e schema: "
+        f"t=c0({unit}) x=c1 y=c2 p=c3"
+        f"   |  {len(t):,} events, {duration_s:.4f}s"
+    )
+
+    return dict(
+        x=x,
+        y=y,
+        t=t,
+        p=p,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -358,7 +381,7 @@ def main():
     else:
         raw = run_cli(repo, paths, v, seed, fps, W, H, out_dir / "_work_cli")
 
-    ev = normalize_events(raw, W, H, dur_us)
+    ev = normalize_events(raw, W, H, dur_us, args.mode)
     attrs = dict(simulator="v2e", mode=args.mode, git_commit=git_hash(repo),
                  seed=seed, fps=fps, width=W, height=H,
                  source=str(in_dir), params=v)

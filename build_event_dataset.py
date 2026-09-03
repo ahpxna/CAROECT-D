@@ -17,7 +17,7 @@ import numpy as np
 from label_transfer import event_index_bounds
 
 
-REPRESENTATION_VERSION = "caroectd-count-time-v2"
+REPRESENTATION_VERSION = "caroectd-count-time-v3"
 
 
 def load_events_h5(path):
@@ -45,7 +45,11 @@ def fit_count_clip(events, windows, width, height, percentile=99.5):
     """Fit one ON/OFF clip from training windows only."""
     histogram = np.zeros(2, dtype=np.int64)
     for window in windows:
-        lo, hi = event_index_bounds(events["t"], window["t_start_us"], window["t_end_us"])
+        lo, hi = event_index_bounds(
+            events["t"],
+            window["t_start_us"],
+            window["t_end_us"]
+        )
         on, off, _, _ = count_maps(events, lo, hi, width, height)
         values = np.concatenate((on[on > 0], off[off > 0]))
         if not len(values):
@@ -185,7 +189,10 @@ def update_coco(root, split, site_id, class_names, samples):
             "site_id": site_id,
             "frame_idx": int(sample["frame_idx"]),
             "t_k_us": float(sample["t_k_us"]),
+            "t_start_us": float(sample["t_start_us"]),
+            "t_end_us": float(sample["t_end_us"]),
             "window_us": float(sample["window_us"]),
+            "nominal_window_us": float(sample["nominal_window_us"]),
             "event_index_start": int(sample["event_index_start"]),
             "event_index_end": int(sample["event_index_end"]),
         })
@@ -217,6 +224,12 @@ def resolve_representation(args, events, payload, root):
             raise ValueError(f"Incompatible representation manifest: {path}")
         if float(representation["window_us"]) != float(payload["window_us"]):
             raise ValueError("Representation window_us does not match windows.json")
+        if representation.get("interval") != payload.get("interval"):
+            raise ValueError("Representation interval does not match windows.json")
+        if representation.get("window_definition") != payload.get("window_definition"):
+            raise ValueError(
+                "Representation window_definition does not match windows.json"
+            )
         fit_source = representation.get("fit_source")
         if not isinstance(fit_source, dict) or not fit_source.get("events") or not fit_source.get("windows"):
             raise ValueError(
@@ -245,7 +258,8 @@ def resolve_representation(args, events, payload, root):
         "fitting_split": "train",
         "shared_on_off_scale": True,
         "window_us": float(payload["window_us"]),
-        "interval": "[t_k-window_us,t_k)",
+        "interval": payload["interval"],
+        "window_definition": payload["window_definition"],
         "fit_method": "explicit_count_clip" if args.count_clip is not None else "positive_count_percentile",
         "fit_source": {
             "events": str(Path(args.events).resolve()),
@@ -263,7 +277,21 @@ def resolve_representation(args, events, payload, root):
 def process(args):
     payload = json.loads(Path(args.windows).read_text())
     if payload.get("label_semantics") != "causal_exact_frame_observation":
-        raise RuntimeError("Refusing non-causal/interpolated labels in the normal dataset builder")
+        raise RuntimeError(
+            "Refusing non-causal/interpolated labels in the normal dataset builder"
+        )
+
+    if payload.get("interval") != "[t_{k-1},t_k)":
+        raise RuntimeError(
+            f"Expected adjacent-frame interval [t_{{k-1}},t_k), "
+            f"got {payload.get('interval')!r}"
+        )
+
+    if payload.get("window_definition") != "adjacent_rgb_frame_timestamps":
+        raise RuntimeError(
+            f"Expected window_definition='adjacent_rgb_frame_timestamps', "
+            f"got {payload.get('window_definition')!r}"
+        )
     events = load_events_h5(args.events)
     width, height = int(payload["width"]), int(payload["height"])
     root = Path(args.output)
@@ -280,7 +308,19 @@ def process(args):
     sample_rows = []
     coco_samples = []
     for index, window in enumerate(payload["windows"]):
-        lo, hi = event_index_bounds(events["t"], window["t_start_us"], window["t_end_us"])
+        calc_lo, calc_hi = event_index_bounds(events["t"], window["t_start_us"], window["t_end_us"], )
+
+        stored_lo = int(window.get("event_index_start", calc_lo))
+        stored_hi = int(window.get("event_index_end", calc_hi))
+
+        if stored_lo != calc_lo or stored_hi != calc_hi:
+            raise RuntimeError(
+                f"Event-index mismatch at frame {window['frame_idx']}: "
+                f"windows.json=({stored_lo},{stored_hi}) "
+                f"recomputed=({calc_lo},{calc_hi})"
+            )
+
+        lo, hi = stored_lo, stored_hi
         image = render_window(
             events, lo, hi, window["t_start_us"], window["t_end_us"],
             width, height, count_clip,
@@ -292,7 +332,10 @@ def process(args):
             boxes = [transform_box_letterbox(box, transform) for box in boxes]
 
         stem = f"{args.site_id}_{int(window.get('frame_idx', index)):06d}"
-        cv2.imwrite(str(image_dir / f"{stem}.png"), image)
+        cv2.imwrite(
+            str(image_dir / f"{stem}.png"),
+            cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        )
         with open(label_dir / f"{stem}.txt", "w") as handle:
             for box in boxes:
                 handle.write(
@@ -303,7 +346,10 @@ def process(args):
             "sample": stem,
             "frame_idx": int(window["frame_idx"]),
             "t_k_us": float(window["t_end_us"]),
-            "window_us": float(payload["window_us"]),
+            "t_start_us": float(window["t_start_us"]),
+            "t_end_us": float(window["t_end_us"]),
+            "window_us": float(window["t_end_us"] - window["t_start_us"]),
+            "nominal_window_us": float(payload["window_us"]),
             "event_index_start": lo,
             "event_index_end": hi,
             "n_events": hi - lo,
@@ -317,7 +363,10 @@ def process(args):
             "height": int(image.shape[0]),
             "frame_idx": int(window["frame_idx"]),
             "t_k_us": float(window["t_end_us"]),
-            "window_us": float(payload["window_us"]),
+            "t_start_us": float(window["t_start_us"]),
+            "t_end_us": float(window["t_end_us"]),
+            "window_us": float(window["t_end_us"] - window["t_start_us"]),
+            "nominal_window_us": float(payload["window_us"]),
             "event_index_start": lo,
             "event_index_end": hi,
             "boxes": boxes,
@@ -347,6 +396,8 @@ def process(args):
         "events": str(Path(args.events).resolve()),
         "windows": str(Path(args.windows).resolve()),
         "window_us": float(payload["window_us"]),
+        "interval": payload["interval"],
+        "window_definition": payload["window_definition"],
         "sample_metadata": str(metadata_path.resolve()),
         "coco_annotations": str(coco_path.resolve()) if coco_path else None,
     })

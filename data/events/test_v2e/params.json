@@ -1,0 +1,21 @@
+{
+  "simulator": "v2e",
+  "mode": "lib",
+  "git_commit": "cac638444557a224ba6ee5c29260916f152c00bd",
+  "seed": 42,
+  "fps": 119.88,
+  "width": 1280,
+  "height": 720,
+  "source": "data/processed/test",
+  "params": {
+    "pos_thres": 0.25,
+    "neg_thres": 0.25,
+    "sigma_thres": 0.03,
+    "cutoff_hz": 200,
+    "leak_rate_hz": 0.1,
+    "shot_noise_rate_hz": 0.001,
+    "refractory_period": 0.001,
+    "disable_slomo": true,
+    "slomo_model": null
+  }
+}

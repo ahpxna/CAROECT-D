@@ -105,29 +105,48 @@ def build_causal_windows(
     window_us: float,
     offset_us: float = 0.0,
 ) -> list[dict]:
-    """Create [t_k-window_us, t_k) samples with exact frame-k observations."""
+    """
+    Create exact causal inter-frame samples [t_{k-1}, t_k).
+
+    The previous actual RGB frame timestamp is used as the window start,
+    rather than t_k - nominal_window_us. This guarantees contiguous,
+    non-overlapping event windows despite integer-rounded frame timestamps.
+
+    Labels are still the exact SAM3 observation at frame k.
+    No interpolation and no future-frame information are used.
+    """
     if window_us <= 0:
         raise ValueError("window_us must be positive")
+
     frame_times = np.asarray(frame_times_us, dtype=np.float64)
-    if not len(frame_times):
+
+    if len(frame_times) < 2:
         return []
-    clip_start_rgb_us = float(frame_times[0])
+
+    if np.any(np.diff(frame_times) <= 0):
+        raise ValueError("frame_times_us must be strictly increasing")
+
     windows = []
-    for frame_idx, rgb_t_us in enumerate(frame_times):
-        # A causal sample is valid only when the RGB source contains the full
-        # requested history. Do not create positive labels over a padded/empty
-        # pre-roll before the clip starts.
-        if float(rgb_t_us) - clip_start_rgb_us < float(window_us):
-            continue
-        end_us = float(rgb_t_us) + float(offset_us)
+
+    # frame 0 has no preceding RGB interval, so samples begin at frame 1.
+    for frame_idx in range(1, len(frame_times)):
+        prev_rgb_t_us = float(frame_times[frame_idx - 1])
+        rgb_t_us = float(frame_times[frame_idx])
+
+        start_us = prev_rgb_t_us + float(offset_us)
+        end_us = rgb_t_us + float(offset_us)
+
         boxes = []
+
         for track_id in sorted(tracks):
             track = tracks[track_id]
             observation = track["by_frame"].get(frame_idx)
+
             if observation is None:
                 continue
-            # Copy the observed values directly. Do not clip, interpolate, or
-            # consult frame k+1: exact frame observations are the target labels.
+
+            # Exact frame-k observation only.
+            # No clipping, interpolation, or future-frame lookup.
             box = {
                 "track_id": track_id,
                 "class_id": track["class_id"],
@@ -137,18 +156,24 @@ def build_causal_windows(
                 "h": observation["h"],
                 "mask_path": observation.get("mask_path"),
                 "score": observation.get("score"),
-                "sam_source": observation.get("chosen_source", observation.get("source")),
+                "sam_source": observation.get(
+                    "chosen_source",
+                    observation.get("source"),
+                ),
             }
+
             boxes.append(box)
+
         windows.append({
             "sample_index": len(windows),
             "frame_idx": frame_idx,
             "rgb_t_us": int(rgb_t_us),
-            "t_start_us": end_us - float(window_us),
+            "t_start_us": start_us,
             "t_end_us": end_us,
             "label_time_us": end_us,
             "boxes": boxes,
         })
+
     return windows
 
 
@@ -283,9 +308,9 @@ def main() -> None:
         "width": width,
         "height": height,
         "n_frames": len(frame_times),
-        "frame_times_us": [int(value) for value in frame_times],
         "window_us": float(args.window_us),
-        "interval": "[t_k-window_us,t_k)",
+        "interval": "[t_{k-1},t_k)",
+        "window_definition": "adjacent_rgb_frame_timestamps",
         "label_semantics": label_semantics,
         "clock_alignment": {
             "offset_us": offset_us,

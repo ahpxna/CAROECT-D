@@ -298,7 +298,16 @@ def _collect_direction(predictor, video_folder: str, prompt: str, class_id: int,
                 continue
             raw_obj_id = int(obj_id)
             key = f"{class_id}_{direction}_{raw_obj_id}"
-            box = [float(value) for value in output["out_boxes_xywh"][index]]
+
+            # This SAM3 build returns normalized [x_min, y_min, width, height].
+            # Convert ONCE here to the project's canonical center-format
+            # [cx, cy, width, height] before tracking / IoU / merging / YOLO export.
+            x_min, y_min, bw, bh = [
+                float(value) for value in output["out_boxes_xywh"][index]
+            ]
+            cx = x_min + bw / 2.0
+            cy = y_min + bh / 2.0
+
             mask_path = None
             if masks is not None and index < len(masks):
                 mask_name = (
@@ -317,8 +326,13 @@ def _collect_direction(predictor, video_folder: str, prompt: str, class_id: int,
             entry["frames"].append({
                 "frame_idx": int(frame_idx),
                 "t_us": int(round(frame_idx * 1e6 / fps)),
-                "cx": box[0], "cy": box[1], "w": box[2], "h": box[3],
-                "score": score, "mask_path": mask_path, "source": direction,
+                "cx": cx,
+                "cy": cy,
+                "w": bw,
+                "h": bh,
+                "score": score,
+                "mask_path": mask_path,
+                "source": direction,
             })
     predictor.handle_request(request=dict(type="close_session", session_id=session_id))
     return tracks

@@ -1,0 +1,13 @@
+path: /home/duolu/Downloads/CAROECT-D-main(1)/CAROECT-D-main/data/event_dataset/test_dvsvolt
+train: train/images
+val: val/images
+test: test/images
+names:
+  0: car
+  1: truck
+  2: bus
+  3: motorcycle
+  4: person
+  5: bicycle
+  6: micromobility
+  7: other

@@ -1,0 +1,21 @@
+{
+  "simulator": "dvs_voltmeter",
+  "mode": "lib",
+  "git_commit": "9d86353ecfaaa1af82b9eb66b162f0bf80cd4861",
+  "seed": 42,
+  "fps": 119.88,
+  "width": 1280,
+  "height": 720,
+  "camera_type": "DVS346",
+  "source": "data/processed/test",
+  "params": {
+    "k": [
+      5.3,
+      20.0,
+      0.0001,
+      1e-07,
+      5e-09,
+      1e-05
+    ]
+  }
+}
